@@ -1,0 +1,4 @@
+{"audio": "/data/audio/call_001_user_02.wav", "prompt": "销售员：好的，请问您对我们的保险产品感兴趣吗？", "chosen": "language Chinese<asr_text>嗯，我想了解一下你们那个百万医疗险，就是住院能报销的那种", "rejected": "language Chinese<asr_text>嗯我想了解一下你们那个百万医疗险就是住院能报销那种"}
+{"audio": "/data/audio/call_001_user_03.wav", "prompt": "销售员：我们这款百万医疗险，住院医疗最高报销400万，免赔额是一万", "chosen": "language Chinese<asr_text>那个免赔额是一万块钱是吧", "rejected": "language Chinese<asr_text>那个免赔额是一万块钱是把"}
+{"audio": "/data/audio/call_002_user_01.wav", "prompt": "销售员：您好，这里是XX保险客服中心，请问有什么可以帮您？", "chosen": "language Chinese<asr_text>你好，我之前买过一个重疾险，想问一下理赔的事情", "rejected": "language Chinese<asr_text>你好我之前买过一个重疾险想问一下理赔的事情"}
+{"audio": "/data/audio/call_002_user_02.wav", "prompt": "销售员：好的，请问您是在我们这边购买的重疾险对吗？", "chosen": "language Chinese<asr_text>嗯对，就是去年十月份买的那个", "rejected": "language Chinese<asr_text>嗯对就是去年十月份买的那个"}
