@@ -1,21 +1,26 @@
 """
-Qwen3-ASR 推理客户端
-支持：单条识别、批量识别、带上下文识别、流式识别
+Qwen3-ASR 推理客户端（支持 context 热词 + vLLM 服务 + 本地推理）
 
-服务端：通过 deploy_vllm.sh 启动的 vLLM 服务
+支持两种推理方式：
+  1. vLLM 服务模式：调用 deploy_vllm.sh 启动的 OpenAI 兼容 API
+  2. 本地推理模式：直接加载模型，使用 qwen-asr SDK（支持 context 热词）
 
 用法：
+    # === vLLM 服务模式 ===
     # 单条识别
-    python asr_client.py --audio /path/to/audio.wav
+    python asr_client.py --audio /path/to/audio.wav --context "百万医疗险 保险"
 
-    # 带销售员上下文识别
-    python asr_client.py --audio /path/to/audio.wav --context "销售员：请问您需要什么产品？"
+    # 批量识别
+    python asr_client.py --audio_dir /data/audios/ --output results.jsonl
 
-    # 批量识别（目录下所有 wav 文件）
-    python asr_client.py --audio_dir /path/to/audio_dir/ --output results.jsonl
-
-    # 启动 HTTP 服务（供业务系统调用）
+    # 启动 HTTP 服务
     python asr_client.py --serve --port 9000
+
+    # === 本地推理模式（推荐，支持 context 热词） ===
+    python asr_client.py --local --model_path /path/to/model --audio /path/to/audio.wav --context "百万医疗险"
+
+    # 本地批量识别
+    python asr_client.py --local --model_path /path/to/model --audio_dir /data/audios/ --context "百万医疗险 保费"
 """
 
 import os
@@ -35,11 +40,196 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# ASR 客户端核心类
+# 热词/上下文工具
 # ============================================================
 
-class Qwen3ASRClient:
-    """Qwen3-ASR vLLM 推理客户端"""
+def extract_keywords_from_sales_text(sales_text: str) -> str:
+    """
+    从销售员话术中提取关键词，作为 ASR context
+
+    Qwen3-ASR 的 context 参数接受空格分隔的关键词/术语，
+    模型会在解码时偏向识别这些词。
+
+    示例：
+        输入: "您好，我给您介绍一下我们的百万医疗险，住院报销比例可达100%"
+        输出: "百万医疗险 住院报销 100%"
+    """
+    import re
+
+    # 简单提取：去除常见口语词，保留有意义的名词/术语
+    stopwords = {
+        "您好", "你好", "请问", "我们", "我是", "的", "了", "吗", "呢", "吧",
+        "是", "有", "在", "就是", "那个", "这个", "一下", "可以", "能", "会",
+        "给您", "跟您", "帮您", "对", "嗯", "啊", "哦", "好的", "行",
+    }
+
+    # 按标点分割
+    segments = re.split(r'[，。！？、；：""''（）《》【】\s]+', sales_text)
+    keywords = []
+    for seg in segments:
+        seg = seg.strip()
+        if seg and seg not in stopwords and len(seg) >= 2:
+            keywords.append(seg)
+
+    return " ".join(keywords)
+
+
+def load_hotwords_file(hotwords_path: str) -> str:
+    """
+    从热词文件加载，每行一个热词
+
+    文件格式：
+        百万医疗险
+        住院报销
+        免赔额
+        等待期
+    """
+    hotwords = []
+    with open(hotwords_path, "r", encoding="utf-8") as f:
+        for line in f:
+            word = line.strip()
+            if word and not word.startswith("#"):
+                hotwords.append(word)
+    return " ".join(hotwords)
+
+
+# ============================================================
+# 本地推理客户端（使用 qwen-asr SDK，支持 context）
+# ============================================================
+
+class Qwen3ASRLocalClient:
+    """
+    本地推理客户端，直接使用 qwen-asr SDK
+
+    优势：完整支持 context 参数，可传入热词提升术语识别率
+    """
+
+    def __init__(
+        self,
+        model_path: str = "Qwen/Qwen3-ASR-1.7B",
+        device: str = "cuda:0",
+        forced_aligner: Optional[str] = None,
+        max_batch_size: int = 32,
+        max_new_tokens: int = 512,
+    ):
+        import torch
+        from qwen_asr import Qwen3ASRModel
+
+        logger.info(f"Loading Qwen3-ASR from {model_path}")
+        aligner_kwargs = {}
+        if forced_aligner:
+            aligner_kwargs = {
+                "forced_aligner": forced_aligner,
+                "forced_aligner_kwargs": dict(
+                    dtype=torch.bfloat16,
+                    device_map=device,
+                ),
+            }
+
+        self.model = Qwen3ASRModel.from_pretrained(
+            model_path,
+            dtype=torch.bfloat16,
+            device_map=device,
+            max_inference_batch_size=max_batch_size,
+            max_new_tokens=max_new_tokens,
+            **aligner_kwargs,
+        )
+        logger.info("Model loaded successfully")
+
+    def transcribe(
+        self,
+        audio_path: Optional[str] = None,
+        audio_url: Optional[str] = None,
+        context: Optional[str] = None,
+        language: Optional[str] = "Chinese",
+        return_timestamps: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        单条识别
+
+        Args:
+            audio_path: 本地文件路径
+            audio_url: 远程 URL
+            context: 热词/术语，空格分隔（如 "百万医疗险 住院报销 免赔额"）
+            language: 语言
+            return_timestamps: 是否返回时间戳
+        """
+        audio_input = audio_path or audio_url
+        if not audio_input:
+            return {"text": "", "error": "No audio input provided"}
+
+        start_time = time.time()
+        results = self.model.transcribe(
+            audio=audio_input,
+            context=context or "",
+            language=language,
+            return_time_stamps=return_timestamps,
+        )
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        r = results[0]
+        output = {
+            "text": r.text,
+            "language": r.language,
+            "latency_ms": latency_ms,
+        }
+        if return_timestamps and r.time_stamps:
+            output["timestamps"] = [
+                {"text": ts.text, "start": ts.start_time, "end": ts.end_time}
+                for ts in r.time_stamps
+            ]
+        return output
+
+    def transcribe_batch(
+        self,
+        audio_paths: List[str],
+        contexts: Optional[List[str]] = None,
+        language: Optional[str] = "Chinese",
+        return_timestamps: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        批量识别（SDK 原生批量，效率最高）
+        """
+        contexts = contexts or [""] * len(audio_paths)
+        languages = [language] * len(audio_paths)
+
+        start_time = time.time()
+        results = self.model.transcribe(
+            audio=audio_paths,
+            context=contexts,
+            language=languages,
+            return_time_stamps=return_timestamps,
+        )
+        total_latency = int((time.time() - start_time) * 1000)
+
+        outputs = []
+        for i, r in enumerate(results):
+            out = {
+                "audio_path": audio_paths[i],
+                "text": r.text,
+                "language": r.language,
+                "latency_ms": total_latency // len(audio_paths),
+            }
+            if return_timestamps and r.time_stamps:
+                out["timestamps"] = [
+                    {"text": ts.text, "start": ts.start_time, "end": ts.end_time}
+                    for ts in r.time_stamps
+                ]
+            outputs.append(out)
+
+        logger.info(
+            f"Batch done: {len(audio_paths)} files, "
+            f"total {total_latency}ms, avg {total_latency//len(audio_paths)}ms/file"
+        )
+        return outputs
+
+
+# ============================================================
+# vLLM 远程推理客户端
+# ============================================================
+
+class Qwen3ASRVLLMClient:
+    """vLLM 服务推理客户端（OpenAI 兼容 API）"""
 
     def __init__(
         self,
@@ -51,12 +241,10 @@ class Qwen3ASRClient:
         self.api_url = f"{self.base_url}/v1/chat/completions"
         self.timeout = timeout
         self.language = language
-
-        # 检查连接
+        self.model_id = None
         self._check_connection()
 
     def _check_connection(self):
-        """检查 vLLM 服务是否可用"""
         try:
             resp = requests.get(f"{self.base_url}/v1/models", timeout=5)
             if resp.status_code == 200:
@@ -65,45 +253,41 @@ class Qwen3ASRClient:
                     self.model_id = models[0]["id"]
                     logger.info(f"Connected to vLLM. Model: {self.model_id}")
                     return
-            logger.warning(f"vLLM service responded but no models found")
         except requests.ConnectionError:
-            logger.warning(f"Cannot connect to {self.base_url}, will retry on first call")
-        self.model_id = None
+            logger.warning(f"Cannot connect to {self.base_url}")
 
     def _encode_audio_base64(self, audio_path: str) -> str:
-        """将音频文件编码为 base64"""
         with open(audio_path, "rb") as f:
-            audio_bytes = f.read()
-        return base64.b64encode(audio_bytes).decode("utf-8")
+            return base64.b64encode(f.read()).decode("utf-8")
 
-    def _build_messages(
+    def transcribe(
         self,
         audio_path: Optional[str] = None,
         audio_url: Optional[str] = None,
         audio_base64: Optional[str] = None,
         context: Optional[str] = None,
         dialogue_history: Optional[List[Dict]] = None,
-    ) -> List[Dict]:
+        temperature: float = 0.0,
+        max_tokens: int = 512,
+    ) -> Dict[str, Any]:
         """
-        构建 chat messages
+        单条识别
 
-        支持三种音频输入方式：
-        1. audio_path: 本地文件路径（自动转 base64）
-        2. audio_url: 远程 URL
-        3. audio_base64: 已编码的 base64 字符串
+        注意：vLLM 模式下 context 通过 system prompt 注入，
+        效果不如本地推理的原生 context 参数。
         """
         messages = []
 
-        # System message（含上下文指令）
+        # System message
         system_text = "你是一个电销场景的语音识别助手。请准确识别用户的语音内容。"
-        if context or dialogue_history:
-            system_text += "\n请结合以下对话上下文进行识别："
+        if context:
+            system_text += f"\n请特别注意以下术语的准确识别：{context}"
         messages.append({"role": "system", "content": system_text})
 
-        # User message
+        # User content
         user_content = []
 
-        # 添加上下文（文本部分）
+        # 对话上下文
         context_text = ""
         if dialogue_history:
             context_text = "【对话上下文】\n"
@@ -111,22 +295,18 @@ class Qwen3ASRClient:
                 role = "销售员" if turn["role"] == "sales" else "用户"
                 context_text += f"{role}：{turn['text']}\n"
             context_text += "\n【请识别以下用户语音】"
-        elif context:
-            context_text = f"【销售员上一句话】\n{context}\n\n【请识别以下用户语音】"
-
         if context_text:
             user_content.append({"type": "text", "text": context_text})
 
-        # 添加音频
+        # 音频
         if audio_path:
             audio_b64 = self._encode_audio_base64(audio_path)
-            # 根据文件扩展名确定 MIME 类型
             ext = Path(audio_path).suffix.lower()
-            mime_map = {".wav": "audio/wav", ".mp3": "audio/mp3", ".flac": "audio/flac", ".ogg": "audio/ogg"}
-            mime_type = mime_map.get(ext, "audio/wav")
+            mime_map = {".wav": "audio/wav", ".mp3": "audio/mp3", ".flac": "audio/flac"}
+            mime = mime_map.get(ext, "audio/wav")
             user_content.append({
                 "type": "audio_url",
-                "audio_url": {"url": f"data:{mime_type};base64,{audio_b64}"},
+                "audio_url": {"url": f"data:{mime};base64,{audio_b64}"},
             })
         elif audio_url:
             user_content.append({
@@ -140,45 +320,6 @@ class Qwen3ASRClient:
             })
 
         messages.append({"role": "user", "content": user_content})
-        return messages
-
-    def transcribe(
-        self,
-        audio_path: Optional[str] = None,
-        audio_url: Optional[str] = None,
-        audio_base64: Optional[str] = None,
-        context: Optional[str] = None,
-        dialogue_history: Optional[List[Dict]] = None,
-        temperature: float = 0.0,
-        max_tokens: int = 512,
-    ) -> Dict[str, Any]:
-        """
-        单条音频识别
-
-        Args:
-            audio_path: 本地音频文件路径
-            audio_url: 远程音频 URL
-            audio_base64: base64 编码的音频数据
-            context: 销售员上下文文本
-            dialogue_history: 完整对话历史
-            temperature: 生成温度（ASR 建议 0）
-            max_tokens: 最大生成 token 数
-
-        Returns:
-            {
-                "text": "识别结果文本",
-                "language": "Chinese",
-                "latency_ms": 123,
-                "usage": {...}
-            }
-        """
-        messages = self._build_messages(
-            audio_path=audio_path,
-            audio_url=audio_url,
-            audio_base64=audio_base64,
-            context=context,
-            dialogue_history=dialogue_history,
-        )
 
         payload = {
             "messages": messages,
@@ -190,30 +331,21 @@ class Qwen3ASRClient:
 
         start_time = time.time()
         try:
-            resp = requests.post(
-                self.api_url,
-                headers={"Content-Type": "application/json"},
-                json=payload,
-                timeout=self.timeout,
-            )
+            resp = requests.post(self.api_url, json=payload, timeout=self.timeout)
             resp.raise_for_status()
         except requests.RequestException as e:
             return {"text": "", "error": str(e), "latency_ms": 0}
 
         latency_ms = int((time.time() - start_time) * 1000)
         result = resp.json()
-
         content = result["choices"][0]["message"]["content"]
-        usage = result.get("usage", {})
 
-        # 解析 ASR 输出（尝试用 qwen_asr 的解析器）
-        language = self.language
         text = content
+        language = self.language
         try:
             from qwen_asr import parse_asr_output
             language, text = parse_asr_output(content)
         except (ImportError, Exception):
-            # 如果没有 qwen_asr 包，直接用原始输出
             pass
 
         return {
@@ -221,7 +353,7 @@ class Qwen3ASRClient:
             "language": language,
             "raw_output": content,
             "latency_ms": latency_ms,
-            "usage": usage,
+            "usage": result.get("usage", {}),
         }
 
     def transcribe_batch(
@@ -229,20 +361,7 @@ class Qwen3ASRClient:
         audio_paths: List[str],
         contexts: Optional[List[str]] = None,
         max_workers: int = 4,
-        show_progress: bool = True,
     ) -> List[Dict[str, Any]]:
-        """
-        批量音频识别（并发请求）
-
-        Args:
-            audio_paths: 音频文件路径列表
-            contexts: 对应的上下文列表（可选）
-            max_workers: 并发线程数
-            show_progress: 是否显示进度
-
-        Returns:
-            识别结果列表
-        """
         results = [None] * len(audio_paths)
         contexts = contexts or [None] * len(audio_paths)
 
@@ -261,38 +380,35 @@ class Qwen3ASRClient:
                 idx, result = future.result()
                 results[idx] = result
                 completed += 1
-                if show_progress and completed % 10 == 0:
+                if completed % 10 == 0:
                     logger.info(f"Progress: {completed}/{len(audio_paths)}")
 
         return results
 
 
 # ============================================================
-# HTTP 服务（供业务系统调用）
+# HTTP 服务（封装两种客户端）
 # ============================================================
 
-def create_http_server(client: Qwen3ASRClient, port: int = 9000):
+def create_http_server(client, port: int = 9000):
     """
-    启动一个简单的 HTTP 服务，封装 ASR 调用
+    HTTP 服务，供业务系统调用
 
-    API 接口：
-        POST /asr
-        Content-Type: application/json
-        Body: {
-            "audio_path": "/path/to/audio.wav",     # 服务器本地路径
-            "audio_url": "https://...",              # 或远程 URL
-            "audio_base64": "...",                   # 或 base64 数据
-            "context": "销售员上一句话",               # 可选
-            "dialogue_history": [...]                 # 可选
-        }
+    POST /asr
+    {
+        "audio_path": "/path/to/audio.wav",   # 或 audio_url / audio_base64
+        "context": "百万医疗险 住院报销",       # 热词（空格分隔）
+        "sales_text": "您好，给您介绍百万医疗险",  # 或直接传销售员原文，自动提取热词
+        "dialogue_history": [...]               # 可选
+    }
 
-        POST /asr/batch
-        Body: {
-            "items": [
-                {"audio_path": "...", "context": "..."},
-                ...
-            ]
-        }
+    POST /asr/batch
+    {
+        "items": [{"audio_path": "...", "context": "..."}],
+        "max_workers": 4
+    }
+
+    GET /health
     """
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -303,19 +419,31 @@ def create_http_server(client: Qwen3ASRClient, port: int = 9000):
             data = json.loads(body)
 
             if self.path == "/asr":
+                # 支持传 sales_text 自动提取热词
+                context = data.get("context")
+                if not context and data.get("sales_text"):
+                    context = extract_keywords_from_sales_text(data["sales_text"])
+
                 result = client.transcribe(
                     audio_path=data.get("audio_path"),
                     audio_url=data.get("audio_url"),
                     audio_base64=data.get("audio_base64"),
-                    context=data.get("context"),
+                    context=context,
                     dialogue_history=data.get("dialogue_history"),
                 )
+                if context:
+                    result["context_used"] = context
                 self._respond(200, result)
 
             elif self.path == "/asr/batch":
                 items = data.get("items", [])
                 audio_paths = [it.get("audio_path") for it in items]
-                contexts = [it.get("context") for it in items]
+                contexts = []
+                for it in items:
+                    ctx = it.get("context")
+                    if not ctx and it.get("sales_text"):
+                        ctx = extract_keywords_from_sales_text(it["sales_text"])
+                    contexts.append(ctx)
                 results = client.transcribe_batch(
                     audio_paths=audio_paths,
                     contexts=contexts,
@@ -325,7 +453,6 @@ def create_http_server(client: Qwen3ASRClient, port: int = 9000):
 
             elif self.path == "/health":
                 self._respond(200, {"status": "ok"})
-
             else:
                 self._respond(404, {"error": "not found"})
 
@@ -345,73 +472,111 @@ def create_http_server(client: Qwen3ASRClient, port: int = 9000):
             logger.info(f"{self.address_string()} - {format % args}")
 
     server = HTTPServer(("0.0.0.0", port), ASRHandler)
-    logger.info(f"ASR HTTP service started on port {port}")
-    logger.info(f"  POST /asr         - 单条识别")
-    logger.info(f"  POST /asr/batch   - 批量识别")
-    logger.info(f"  GET  /health      - 健康检查")
+    logger.info(f"ASR HTTP service on port {port}")
+    logger.info(f"  POST /asr         单条识别")
+    logger.info(f"  POST /asr/batch   批量识别")
+    logger.info(f"  GET  /health      健康检查")
     server.serve_forever()
 
 
 # ============================================================
-# 命令行入口
+# CLI
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen3-ASR 推理客户端")
 
-    # 连接参数
+    # 模式选择
+    parser.add_argument("--local", action="store_true",
+                        help="本地推理模式（推荐，完整支持 context 热词）")
+    parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-ASR-1.7B",
+                        help="本地模式的模型路径")
+    parser.add_argument("--forced_aligner", type=str, default=None,
+                        help="ForcedAligner 模型路径（可选，用于时间戳）")
+
+    # vLLM 服务模式
     parser.add_argument("--base_url", type=str, default="http://localhost:8000",
                         help="vLLM 服务地址")
     parser.add_argument("--timeout", type=int, default=60)
 
-    # 单条识别
+    # 识别参数
     parser.add_argument("--audio", type=str, help="音频文件路径")
     parser.add_argument("--audio_url", type=str, help="音频 URL")
-    parser.add_argument("--context", type=str, help="销售员上下文文本")
+    parser.add_argument("--context", type=str,
+                        help="热词/术语，空格分隔（如 '百万医疗险 住院报销'）")
+    parser.add_argument("--hotwords_file", type=str,
+                        help="热词文件路径（每行一个热词）")
+    parser.add_argument("--sales_text", type=str,
+                        help="销售员原文（自动提取热词）")
     parser.add_argument("--language", type=str, default="Chinese")
+    parser.add_argument("--timestamps", action="store_true",
+                        help="返回时间戳（本地模式 + ForcedAligner）")
 
-    # 批量识别
-    parser.add_argument("--audio_dir", type=str, help="音频目录（批量识别）")
-    parser.add_argument("--output", type=str, default="asr_results.jsonl",
-                        help="批量识别结果输出文件")
-    parser.add_argument("--max_workers", type=int, default=4,
-                        help="并发线程数")
-
-    # 上下文文件（批量时使用）
+    # 批量
+    parser.add_argument("--audio_dir", type=str, help="音频目录")
+    parser.add_argument("--output", type=str, default="asr_results.jsonl")
+    parser.add_argument("--max_workers", type=int, default=4)
     parser.add_argument("--context_file", type=str,
-                        help="上下文文件 (JSONL)，每行 {audio_path, context}")
+                        help="上下文文件 (JSONL): {audio_path, context/sales_text}")
 
-    # HTTP 服务模式
-    parser.add_argument("--serve", action="store_true",
-                        help="启动 HTTP 服务模式")
-    parser.add_argument("--port", type=int, default=9000,
-                        help="HTTP 服务端口")
+    # HTTP 服务
+    parser.add_argument("--serve", action="store_true")
+    parser.add_argument("--port", type=int, default=9000)
 
     args = parser.parse_args()
 
-    # 创建客户端
-    client = Qwen3ASRClient(
-        base_url=args.base_url,
-        timeout=args.timeout,
-        language=args.language,
-    )
+    # ---- 合并 context 来源 ----
+    context = args.context or ""
+    if args.hotwords_file:
+        context = load_hotwords_file(args.hotwords_file)
+    elif args.sales_text and not context:
+        context = extract_keywords_from_sales_text(args.sales_text)
 
-    # ---- HTTP 服务模式 ----
+    if context:
+        logger.info(f"Context keywords: {context}")
+
+    # ---- 创建客户端 ----
+    if args.local:
+        client = Qwen3ASRLocalClient(
+            model_path=args.model_path,
+            forced_aligner=args.forced_aligner,
+        )
+    else:
+        client = Qwen3ASRVLLMClient(
+            base_url=args.base_url,
+            timeout=args.timeout,
+            language=args.language,
+        )
+
+    # ---- HTTP 服务 ----
     if args.serve:
         create_http_server(client, port=args.port)
         return
 
     # ---- 单条识别 ----
     if args.audio or args.audio_url:
-        result = client.transcribe(
-            audio_path=args.audio,
-            audio_url=args.audio_url,
-            context=args.context,
-        )
+        if args.local:
+            result = client.transcribe(
+                audio_path=args.audio,
+                audio_url=args.audio_url,
+                context=context,
+                language=args.language,
+                return_timestamps=args.timestamps,
+            )
+        else:
+            result = client.transcribe(
+                audio_path=args.audio,
+                audio_url=args.audio_url,
+                context=context,
+            )
         print(f"\n{'='*50}")
         print(f"  识别结果: {result['text']}")
         print(f"  语言:     {result.get('language', 'N/A')}")
         print(f"  耗时:     {result['latency_ms']}ms")
+        if context:
+            print(f"  热词:     {context}")
+        if result.get("timestamps"):
+            print(f"  时间戳:   {len(result['timestamps'])} segments")
         if result.get("error"):
             print(f"  错误:     {result['error']}")
         print(f"{'='*50}\n")
@@ -424,38 +589,43 @@ def main():
             str(p) for p in audio_dir.glob("*")
             if p.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
         )
-        logger.info(f"Found {len(audio_paths)} audio files in {audio_dir}")
+        logger.info(f"Found {len(audio_paths)} audio files")
 
-        # 加载上下文（如果有）
-        contexts = [None] * len(audio_paths)
+        # 加载每条音频的上下文
+        contexts = [context] * len(audio_paths)
         if args.context_file:
             context_map = {}
             with open(args.context_file, "r", encoding="utf-8") as f:
                 for line in f:
                     item = json.loads(line.strip())
-                    context_map[item["audio_path"]] = item.get("context", "")
-            contexts = [context_map.get(p) for p in audio_paths]
-            logger.info(f"Loaded {len(context_map)} context entries")
+                    ctx = item.get("context", "")
+                    if not ctx and item.get("sales_text"):
+                        ctx = extract_keywords_from_sales_text(item["sales_text"])
+                    context_map[item["audio_path"]] = ctx
+            contexts = [context_map.get(p, context) for p in audio_paths]
 
-        # 批量推理
-        results = client.transcribe_batch(
-            audio_paths=audio_paths,
-            contexts=contexts,
-            max_workers=args.max_workers,
-        )
+        if args.local:
+            results = client.transcribe_batch(
+                audio_paths=audio_paths,
+                contexts=contexts,
+                language=args.language,
+                return_timestamps=args.timestamps,
+            )
+        else:
+            results = client.transcribe_batch(
+                audio_paths=audio_paths,
+                contexts=contexts,
+                max_workers=args.max_workers,
+            )
 
-        # 保存结果
         with open(args.output, "w", encoding="utf-8") as f:
             for r in results:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-        logger.info(f"Results saved to {args.output}")
-
-        # 统计
         total = len(results)
         errors = sum(1 for r in results if r.get("error"))
-        avg_latency = sum(r["latency_ms"] for r in results) / max(total, 1)
-        logger.info(f"Total: {total}, Errors: {errors}, Avg latency: {avg_latency:.0f}ms")
+        avg_lat = sum(r.get("latency_ms", 0) for r in results) / max(total, 1)
+        logger.info(f"Done: {total} files, {errors} errors, avg {avg_lat:.0f}ms")
         return
 
     parser.print_help()
