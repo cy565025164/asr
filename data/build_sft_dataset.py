@@ -1,72 +1,98 @@
 """
 从电销录音标注文件构建 SFT 训练数据集
-
-标注文件格式 (JSONL):
-{"call_id": "call_001", "turn_id": 3, "audio_path": "/data/audio/call_001_user_03.wav",
- "correct_text": "嗯，我想了解一下你们那个百万医疗险", "sales_context": "请问您对我们的保险产品感兴趣吗？",
- "language": "Chinese"}
-
-输出格式（对齐官方）:
-{"audio": "...", "text": "language Chinese<asr_text>...", "prompt": "销售员：..."}
+输出格式对齐 Qwen3-Omni chat template
 """
 
 import json
+import random
 import argparse
 import logging
-from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# 三种任务 prompt
+TASK_PROMPTS = {
+    "asr": "请准确识别用户语音内容。",
+    "analyze": "请分析说话人的性别、年龄段、情绪和购买意向。输出JSON格式。",
+    "full": "请先识别用户语音内容，然后分析说话人特征。",
+}
 
-def build_sft_dataset(annotation_file: str, output_file: str, language: str = "Chinese"):
-    """将标注文件转换为 SFT 训练格式"""
-    count = 0
-    skipped = 0
 
-    with open(annotation_file, "r", encoding="utf-8") as fin, \
-         open(output_file, "w", encoding="utf-8") as fout:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
-            ann = json.loads(line)
+def build_sft_item(ann: dict, task: str) -> dict:
+    """构建一条 SFT 数据"""
+    sales_ctx = ann.get("sales_context", "")
+    system_msg = f"你是电销场景语音识别与分析助手。"
+    if sales_ctx:
+        system_msg += f"销售员上一句：{sales_ctx}"
 
-            audio_path = ann.get("audio_path", "")
-            correct_text = ann.get("correct_text", "").strip()
-            sales_context = ann.get("sales_context", "").strip()
-            lang = ann.get("language", language)
+    user_content = [
+        {"type": "audio", "audio": ann["audio_path"]},
+        {"type": "text", "text": TASK_PROMPTS[task]},
+    ]
 
-            if not audio_path or not correct_text:
-                skipped += 1
-                continue
+    # 构建 assistant 回复
+    if task == "asr":
+        assistant = ann["correct_text"]
+    elif task == "analyze":
+        assistant = json.dumps({
+            "gender": ann.get("gender", "未知"),
+            "age_group": ann.get("age_group", "未知"),
+            "emotion": ann.get("emotion", "平静"),
+            "purchase_intent": ann.get("purchase_intent", "未知"),
+        }, ensure_ascii=False)
+    else:  # full
+        analysis = f"性别：{ann.get('gender', '未知')} | 年龄段：{ann.get('age_group', '未知')} | 情绪：{ann.get('emotion', '平静')} | 购买意向：{ann.get('purchase_intent', '未知')}"
+        assistant = f"【ASR】{ann['correct_text']}\n【分析】{analysis}"
 
-            # 检查音频文件是否存在
-            if not Path(audio_path).exists():
-                logger.warning(f"Audio not found: {audio_path}")
-                skipped += 1
-                continue
-
-            # 构建 SFT 格式
-            sft_item = {
-                "audio": audio_path,
-                "text": f"language {lang}<asr_text>{correct_text}",
-                "prompt": f"销售员：{sales_context}" if sales_context else "",
-            }
-            fout.write(json.dumps(sft_item, ensure_ascii=False) + "\n")
-            count += 1
-
-    logger.info(f"Built {count} SFT examples (skipped {skipped}), saved to {output_file}")
+    return {
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant},
+        ]
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="构建 SFT 数据集")
-    parser.add_argument("--annotation_file", type=str, required=True, help="标注文件路径")
-    parser.add_argument("--output_file", type=str, default="train_sft.jsonl", help="输出文件路径")
-    parser.add_argument("--language", type=str, default="Chinese", help="默认语言")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser("构建 SFT 数据集")
+    p.add_argument("--annotation_file", type=str, required=True)
+    p.add_argument("--output_file", type=str, default="train_sft.jsonl")
+    p.add_argument("--task_ratio", type=str, default="asr:0.5,analyze:0.2,full:0.3",
+                   help="任务比例，如 asr:0.5,analyze:0.2,full:0.3")
+    args = p.parse_args()
 
-    build_sft_dataset(args.annotation_file, args.output_file, args.language)
+    # 解析任务比例
+    ratios = {}
+    for item in args.task_ratio.split(","):
+        task, ratio = item.split(":")
+        ratios[task] = float(ratio)
+
+    tasks = list(ratios.keys())
+    weights = list(ratios.values())
+
+    annotations = []
+    with open(args.annotation_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                annotations.append(json.loads(line))
+    logger.info(f"Loaded {len(annotations)} annotations")
+
+    count = 0
+    with open(args.output_file, "w", encoding="utf-8") as fout:
+        for ann in annotations:
+            # 按比例分配任务
+            task = random.choices(tasks, weights=weights, k=1)[0]
+
+            # 分析任务需要有标注
+            if task in ("analyze", "full") and not ann.get("gender"):
+                task = "asr"
+
+            sft_item = build_sft_item(ann, task)
+            fout.write(json.dumps(sft_item, ensure_ascii=False) + "\n")
+            count += 1
+
+    logger.info(f"Built {count} SFT examples, saved to {args.output_file}")
 
 
 if __name__ == "__main__":
