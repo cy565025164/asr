@@ -75,7 +75,8 @@ class OmniService:
         task_cfg = self.tasks_config[task_id]
 
         system_text = task_cfg["system"]
-        if context:
+        # 只有 use_context 的任务（ASR）才注入销售员上下文
+        if context and task_cfg.get("use_context", False):
             system_text += f"\n销售员上一句：{context}"
 
         messages = [

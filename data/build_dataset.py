@@ -48,9 +48,11 @@ def build_assistant_output(task_id: str, task_cfg: dict, ann: dict) -> str:
 def build_messages(task_id: str, task_cfg: dict, ann: dict) -> list:
     """构建 chat messages"""
     system_text = task_cfg["system"]
-    sales_ctx = ann.get("sales_context", "")
-    if sales_ctx:
-        system_text += f"\n销售员上一句：{sales_ctx}"
+    # 只有 ASR 等需要上下文的任务才注入销售员话术
+    if task_cfg.get("use_context", False):
+        sales_ctx = ann.get("sales_context", "")
+        if sales_ctx:
+            system_text += f"\n销售员上一句：{sales_ctx}"
 
     return [
         {"role": "system", "content": system_text},

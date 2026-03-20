@@ -79,7 +79,8 @@ class LocalClient:
         """执行单个任务"""
         task_def = TASK_DEFS[task_id]
         system_text = task_def["system"]
-        if context:
+        # 只有 ASR 需要销售员上下文
+        if context and task_id == "asr":
             system_text += f"\n销售员上一句：{context}"
 
         messages = [

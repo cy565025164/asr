@@ -4,30 +4,31 @@
     "system": "你是语音识别助手，请准确转录用户语音内容。",
     "user_prompt": "请准确识别语音内容。",
     "output_type": "text",
-    "annotation_fields": ["text"]
+    "annotation_fields": ["text"],
+    "use_context": true
   },
   "emotion": {
     "name": "情绪识别",
     "system": "你是语音情绪分析助手，根据说话人的语气、语调、语速判断情绪。",
     "user_prompt": "请判断说话人的情绪状态。输出JSON格式。",
     "output_type": "json",
-    "output_schema": {"emotion": "str", "intensity": "str", "confidence": "float"},
-    "annotation_fields": ["emotion", "intensity", "confidence"]
+    "annotation_fields": ["emotion", "emotion_intensity"],
+    "use_context": false
   },
   "gender": {
     "name": "性别识别",
     "system": "你是语音性别识别助手，根据声音特征判断说话人性别。",
     "user_prompt": "请判断说话人的性别。输出JSON格式。",
     "output_type": "json",
-    "output_schema": {"gender": "str", "confidence": "float"},
-    "annotation_fields": ["gender", "confidence"]
+    "annotation_fields": ["gender"],
+    "use_context": false
   },
   "age": {
     "name": "年龄段识别",
     "system": "你是语音年龄识别助手，根据声音特征判断说话人的大致年龄段。",
     "user_prompt": "请判断说话人的年龄段。输出JSON格式。",
     "output_type": "json",
-    "output_schema": {"age_group": "str", "confidence": "float"},
-    "annotation_fields": ["age_group", "confidence"]
+    "annotation_fields": ["age_group"],
+    "use_context": false
   }
 }
