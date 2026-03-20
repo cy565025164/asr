@@ -1,0 +1,4 @@
+{"audio_path": "/data/audio/call_001_user_01.wav", "sales_context": "您好，我是XX保险的客服小王，请问您方便接听吗？", "text": "嗯你好"}
+{"audio_path": "/data/audio/call_001_user_02.wav", "sales_context": "好的，请问您对我们的保险产品感兴趣吗？", "text": "嗯，我想了解一下你们那个百万医疗险，就是住院能报销的那种"}
+{"audio_path": "/data/audio/call_001_user_03.wav", "sales_context": "我们这款百万医疗险，住院医疗最高报销400万，免赔额是一万", "text": "那个免赔额是一万块钱是吧"}
+{"audio_path": "/data/audio/call_002_user_01.wav", "sales_context": "您好，这里是XX保险客服中心，请问有什么可以帮您？", "text": "你好，我之前买过一个重疾险，想问一下理赔的事情"}

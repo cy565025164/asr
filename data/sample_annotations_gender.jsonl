@@ -1,0 +1,4 @@
+{"audio_path": "/data/audio/call_001_user_01.wav", "gender": "女", "confidence": 0.95}
+{"audio_path": "/data/audio/call_001_user_02.wav", "gender": "女", "confidence": 0.95}
+{"audio_path": "/data/audio/call_001_user_03.wav", "gender": "女", "confidence": 0.9}
+{"audio_path": "/data/audio/call_002_user_01.wav", "gender": "男", "confidence": 0.92}

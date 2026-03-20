@@ -1,98 +1,144 @@
 """
-从电销录音标注文件构建 SFT 训练数据集
-输出格式对齐 Qwen3-Omni chat template
+多任务 SFT 数据集构建
+
+各任务独立标注文件，合并为统一训练数据。
+支持按比例混合。
+
+用法：
+    python build_sft_dataset.py \
+        --tasks asr:annotations_asr.jsonl:0.5 \
+                emotion:annotations_emotion.jsonl:0.2 \
+                gender:annotations_gender.jsonl:0.15 \
+                age:annotations_age.jsonl:0.15 \
+        --output train_sft.jsonl
+
+    # 也可以只构建单个任务
+    python build_sft_dataset.py --tasks asr:annotations_asr.jsonl:1.0 --output train_asr.jsonl
 """
 
 import json
 import random
 import argparse
 import logging
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# 三种任务 prompt
-TASK_PROMPTS = {
-    "asr": "请准确识别用户语音内容。",
-    "analyze": "请分析说话人的性别、年龄段、情绪和购买意向。输出JSON格式。",
-    "full": "请先识别用户语音内容，然后分析说话人特征。",
-}
+# 加载任务定义
+TASKS_FILE = Path(__file__).parent / "tasks.json"
 
 
-def build_sft_item(ann: dict, task: str) -> dict:
-    """构建一条 SFT 数据"""
+def load_tasks_config():
+    with open(TASKS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_sft_message(task_id: str, task_cfg: dict, ann: dict) -> dict:
+    """根据任务定义和标注数据构建一条 SFT messages"""
+
+    # system prompt: 任务定义 + 可选销售上下文
+    system_text = task_cfg["system"]
     sales_ctx = ann.get("sales_context", "")
-    system_msg = f"你是电销场景语音识别与分析助手。"
     if sales_ctx:
-        system_msg += f"销售员上一句：{sales_ctx}"
+        system_text += f"\n销售员上一句：{sales_ctx}"
 
+    # user content: audio + task prompt
     user_content = [
         {"type": "audio", "audio": ann["audio_path"]},
-        {"type": "text", "text": TASK_PROMPTS[task]},
+        {"type": "text", "text": task_cfg["user_prompt"]},
     ]
 
-    # 构建 assistant 回复
-    if task == "asr":
-        assistant = ann["correct_text"]
-    elif task == "analyze":
-        assistant = json.dumps({
-            "gender": ann.get("gender", "未知"),
-            "age_group": ann.get("age_group", "未知"),
-            "emotion": ann.get("emotion", "平静"),
-            "purchase_intent": ann.get("purchase_intent", "未知"),
-        }, ensure_ascii=False)
-    else:  # full
-        analysis = f"性别：{ann.get('gender', '未知')} | 年龄段：{ann.get('age_group', '未知')} | 情绪：{ann.get('emotion', '平静')} | 购买意向：{ann.get('purchase_intent', '未知')}"
-        assistant = f"【ASR】{ann['correct_text']}\n【分析】{analysis}"
+    # assistant 回复
+    if task_cfg["output_type"] == "text":
+        # ASR: 直接输出转录文本
+        assistant_text = ann["text"]
+    else:
+        # JSON 输出: 从标注中提取对应字段
+        output = {}
+        for field in task_cfg["annotation_fields"]:
+            if field in ann:
+                output[field] = ann[field]
+        assistant_text = json.dumps(output, ensure_ascii=False)
 
     return {
+        "task": task_id,
         "messages": [
-            {"role": "system", "content": system_msg},
+            {"role": "system", "content": system_text},
             {"role": "user", "content": user_content},
-            {"role": "assistant", "content": assistant},
-        ]
+            {"role": "assistant", "content": assistant_text},
+        ],
     }
 
 
 def main():
-    p = argparse.ArgumentParser("构建 SFT 数据集")
-    p.add_argument("--annotation_file", type=str, required=True)
-    p.add_argument("--output_file", type=str, default="train_sft.jsonl")
-    p.add_argument("--task_ratio", type=str, default="asr:0.5,analyze:0.2,full:0.3",
-                   help="任务比例，如 asr:0.5,analyze:0.2,full:0.3")
+    p = argparse.ArgumentParser("多任务 SFT 数据集构建")
+    p.add_argument(
+        "--tasks", nargs="+", required=True,
+        help="任务定义，格式 task_id:annotation_file:ratio，如 asr:ann_asr.jsonl:0.5",
+    )
+    p.add_argument("--output", type=str, default="train_sft.jsonl")
+    p.add_argument("--max_samples", type=int, default=0, help="最大样本数，0=不限")
+    p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
-    # 解析任务比例
-    ratios = {}
-    for item in args.task_ratio.split(","):
-        task, ratio = item.split(":")
-        ratios[task] = float(ratio)
+    random.seed(args.seed)
+    tasks_config = load_tasks_config()
 
-    tasks = list(ratios.keys())
-    weights = list(ratios.values())
+    # 解析任务参数
+    task_specs = []
+    for spec in args.tasks:
+        parts = spec.split(":")
+        if len(parts) == 3:
+            tid, fpath, ratio = parts[0], parts[1], float(parts[2])
+        elif len(parts) == 2:
+            tid, fpath, ratio = parts[0], parts[1], 1.0
+        else:
+            raise ValueError(f"格式错误: {spec}，应为 task_id:file:ratio")
 
-    annotations = []
-    with open(args.annotation_file, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                annotations.append(json.loads(line))
-    logger.info(f"Loaded {len(annotations)} annotations")
+        if tid not in tasks_config:
+            raise ValueError(f"未知任务: {tid}，可用: {list(tasks_config.keys())}")
+        task_specs.append((tid, fpath, ratio))
 
-    count = 0
-    with open(args.output_file, "w", encoding="utf-8") as fout:
+    # 加载各任务标注并构建 SFT 数据
+    all_items = []
+    for tid, fpath, ratio in task_specs:
+        annotations = []
+        with open(fpath, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    annotations.append(json.loads(line))
+
+        # 按比例采样
+        if ratio < 1.0:
+            n = max(1, int(len(annotations) * ratio))
+            annotations = random.sample(annotations, min(n, len(annotations)))
+
+        task_cfg = tasks_config[tid]
         for ann in annotations:
-            # 按比例分配任务
-            task = random.choices(tasks, weights=weights, k=1)[0]
+            item = build_sft_message(tid, task_cfg, ann)
+            all_items.append(item)
 
-            # 分析任务需要有标注
-            if task in ("analyze", "full") and not ann.get("gender"):
-                task = "asr"
+        logger.info(f"  {tid}: {len(annotations)} samples")
 
-            sft_item = build_sft_item(ann, task)
-            fout.write(json.dumps(sft_item, ensure_ascii=False) + "\n")
-            count += 1
+    # 打乱
+    random.shuffle(all_items)
 
-    logger.info(f"Built {count} SFT examples, saved to {args.output_file}")
+    if args.max_samples > 0:
+        all_items = all_items[:args.max_samples]
+
+    with open(args.output, "w", encoding="utf-8") as f:
+        for item in all_items:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    # 统计
+    task_counts = {}
+    for item in all_items:
+        t = item["task"]
+        task_counts[t] = task_counts.get(t, 0) + 1
+    logger.info(f"Total: {len(all_items)} samples → {args.output}")
+    for t, c in sorted(task_counts.items()):
+        logger.info(f"  {t}: {c} ({c/len(all_items)*100:.1f}%)")
 
 
 if __name__ == "__main__":

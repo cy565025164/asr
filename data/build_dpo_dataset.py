@@ -1,19 +1,38 @@
 """
-构建 DPO 训练数据集
-使用 Qwen3-Omni 模型推理生成 rejected，或文本扰动
+多任务 DPO 数据集构建
+
+当前主要针对 ASR 任务（文本扰动或模型推理生成 rejected）。
+其他任务可扩展。
+
+用法：
+    # 文本扰动生成 rejected
+    python build_dpo_dataset.py --task asr --annotation_file annotations_asr.jsonl --output train_dpo.jsonl
+
+    # 用模型推理生成 rejected
+    python build_dpo_dataset.py --task asr --annotation_file annotations_asr.jsonl \
+        --model_path Qwen/Qwen3-Omni-30B-A3B-Instruct --output train_dpo.jsonl
 """
 
 import json
 import random
 import argparse
 import logging
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+TASKS_FILE = Path(__file__).parent / "tasks.json"
+
+
+def load_tasks_config():
+    with open(TASKS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ============ 文本扰动 ============
 
 def perturb_text(text: str) -> str:
-    """通过扰动生成错误样本"""
     methods = [_remove_punct, _swap_chars, _drop_char]
     result = text
     for fn in random.sample(methods, min(random.randint(1, 2), len(methods))):
@@ -37,28 +56,37 @@ def _drop_char(t):
     return "".join(chars)
 
 
-def build_dpo_item(ann: dict, rejected_text: str) -> dict:
-    """构建一条 DPO 数据"""
+# ============ 构建 DPO 项 ============
+
+def build_dpo_item(task_id: str, task_cfg: dict, ann: dict, rejected: str) -> dict:
+    system_text = task_cfg["system"]
     sales_ctx = ann.get("sales_context", "")
-    system_msg = "你是电销场景语音识别助手。"
     if sales_ctx:
-        system_msg += f"销售员上一句：{sales_ctx}"
+        system_text += f"\n销售员上一句：{sales_ctx}"
+
+    # chosen
+    if task_cfg["output_type"] == "text":
+        chosen = ann["text"]
+    else:
+        output = {f: ann[f] for f in task_cfg["annotation_fields"] if f in ann}
+        chosen = json.dumps(output, ensure_ascii=False)
 
     return {
+        "task": task_id,
         "messages_prefix": [
-            {"role": "system", "content": system_msg},
+            {"role": "system", "content": system_text},
             {"role": "user", "content": [
                 {"type": "audio", "audio": ann["audio_path"]},
-                {"type": "text", "text": "请准确识别用户语音内容。"},
+                {"type": "text", "text": task_cfg["user_prompt"]},
             ]},
         ],
-        "chosen": ann["correct_text"],
-        "rejected": rejected_text,
+        "chosen": chosen,
+        "rejected": rejected,
     }
 
 
-def build_with_model(annotations, model_path):
-    """用 Qwen3-Omni 推理生成 rejected"""
+def build_with_model(task_id, task_cfg, annotations, model_path):
+    """用模型推理生成 rejected"""
     import torch
     from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
     from qwen_omni_utils import process_mm_info
@@ -70,14 +98,18 @@ def build_with_model(annotations, model_path):
     model.disable_talker()
     processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
 
-    dpo_data = []
+    results = []
     for i, ann in enumerate(annotations):
+        system_text = task_cfg["system"]
         sales_ctx = ann.get("sales_context", "")
+        if sales_ctx:
+            system_text += f"\n销售员上一句：{sales_ctx}"
+
         messages = [
-            {"role": "system", "content": f"你是电销场景语音识别助手。销售员上一句：{sales_ctx}" if sales_ctx else "你是语音识别助手。"},
+            {"role": "system", "content": system_text},
             {"role": "user", "content": [
                 {"type": "audio", "audio": ann["audio_path"]},
-                {"type": "text", "text": "请准确识别用户语音内容。"},
+                {"type": "text", "text": task_cfg["user_prompt"]},
             ]},
         ]
 
@@ -93,45 +125,63 @@ def build_with_model(annotations, model_path):
         output = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1]:],
                                         skip_special_tokens=True)[0].strip()
 
-        rejected = output if output.strip() != ann["correct_text"].strip() else perturb_text(ann["correct_text"])
-        if rejected.strip() == ann["correct_text"].strip():
-            continue
+        # chosen text
+        if task_cfg["output_type"] == "text":
+            chosen = ann["text"]
+        else:
+            chosen = json.dumps({f: ann[f] for f in task_cfg["annotation_fields"] if f in ann}, ensure_ascii=False)
 
-        dpo_data.append(build_dpo_item(ann, rejected))
+        rejected = output if output.strip() != chosen.strip() else perturb_text(chosen)
+        if rejected.strip() != chosen.strip():
+            results.append(build_dpo_item(task_id, task_cfg, ann, rejected))
 
         if (i + 1) % 10 == 0:
             logger.info(f"  {i+1}/{len(annotations)}")
 
-    return dpo_data
+    return results
 
 
 def main():
-    p = argparse.ArgumentParser("构建 DPO 数据集")
+    p = argparse.ArgumentParser("多任务 DPO 数据集构建")
+    p.add_argument("--task", type=str, required=True, help="任务ID: asr, emotion, gender, age")
     p.add_argument("--annotation_file", type=str, required=True)
-    p.add_argument("--output_file", type=str, default="train_dpo.jsonl")
-    p.add_argument("--model_path", type=str, default=None, help="模型路径，不传则用文本扰动")
+    p.add_argument("--output", type=str, default="train_dpo.jsonl")
+    p.add_argument("--model_path", type=str, default=None, help="模型路径，不传用文本扰动")
+    p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
+
+    random.seed(args.seed)
+    tasks_config = load_tasks_config()
+
+    if args.task not in tasks_config:
+        raise ValueError(f"未知任务: {args.task}，可用: {list(tasks_config.keys())}")
+    task_cfg = tasks_config[args.task]
 
     annotations = []
     with open(args.annotation_file, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 annotations.append(json.loads(line))
-    logger.info(f"Loaded {len(annotations)} annotations")
+    logger.info(f"Loaded {len(annotations)} annotations for task={args.task}")
 
     if args.model_path:
-        dpo_data = build_with_model(annotations, args.model_path)
+        dpo_data = build_with_model(args.task, task_cfg, annotations, args.model_path)
     else:
         dpo_data = []
         for ann in annotations:
-            rejected = perturb_text(ann["correct_text"])
-            if rejected.strip() != ann["correct_text"].strip():
-                dpo_data.append(build_dpo_item(ann, rejected))
+            if task_cfg["output_type"] == "text":
+                chosen = ann["text"]
+            else:
+                chosen = json.dumps({f: ann[f] for f in task_cfg["annotation_fields"] if f in ann}, ensure_ascii=False)
 
-    with open(args.output_file, "w", encoding="utf-8") as f:
+            rejected = perturb_text(chosen)
+            if rejected.strip() != chosen.strip():
+                dpo_data.append(build_dpo_item(args.task, task_cfg, ann, rejected))
+
+    with open(args.output, "w", encoding="utf-8") as f:
         for item in dpo_data:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
-    logger.info(f"Built {len(dpo_data)} DPO examples, saved to {args.output_file}")
+    logger.info(f"Built {len(dpo_data)} DPO examples → {args.output}")
 
 
 if __name__ == "__main__":

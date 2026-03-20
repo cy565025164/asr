@@ -1,0 +1,4 @@
+{"audio_path": "/data/audio/call_001_user_01.wav", "sales_context": "您好，我是XX保险的客服小王，请问您方便接听吗？", "emotion": "平静", "intensity": "低", "confidence": 0.9}
+{"audio_path": "/data/audio/call_001_user_02.wav", "sales_context": "好的，请问您对我们的保险产品感兴趣吗？", "emotion": "积极", "intensity": "中", "confidence": 0.85}
+{"audio_path": "/data/audio/call_001_user_03.wav", "sales_context": "我们这款百万医疗险，住院医疗最高报销400万，免赔额是一万", "emotion": "疑惑", "intensity": "低", "confidence": 0.75}
+{"audio_path": "/data/audio/call_002_user_01.wav", "sales_context": "您好，这里是XX保险客服中心，请问有什么可以帮您？", "emotion": "焦虑", "intensity": "中", "confidence": 0.8}
