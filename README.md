@@ -19,11 +19,14 @@
 │   ├── ds_config_zero2.json    # DeepSpeed ZeRO-2
 │   └── ds_config_zero3.json    # DeepSpeed ZeRO-3
 ├── deploy/                     # 部署
-│   ├── deploy_vllm.sh          # vLLM 服务部署
-│   └── deploy_local.py         # 本地 SDK 部署
+│   ├── deploy_vllm.sh          # vLLM 服务部署（ASR）
+│   ├── deploy_local.py         # 本地 SDK 部署（ASR）
+│   └── deploy_omni.sh          # Qwen3-Omni 部署（音频分析）
 ├── inference/                  # 推理
-│   ├── asr_client.py           # 推理客户端
-│   └── asr_server.py           # HTTP 服务
+│   ├── asr_client.py           # ASR 推理客户端
+│   ├── asr_server.py           # ASR HTTP 服务
+│   ├── omni_analyzer.py        # Qwen3-Omni 音频分析（性别/年龄/情绪）
+│   └── pipeline.py             # 双模型并行调度器
 ├── requirements.txt
 └── README.md
 ```
@@ -145,3 +148,54 @@ results = model.transcribe(
 |------|------|------|------|
 | 推理时 | context 参数传销售员话术 | 即时生效，提升术语识别 | 零成本 |
 | 训练时 | SFT/DPO 后训练 | 深度优化整体识别质量 | 需要标注数据 + GPU |
+
+## 双模型架构（实时 ASR + 异步音频分析）
+
+电销场景推荐架构：两个模型并行，ASR 不等分析。
+
+```
+                    ┌─ Qwen3-ASR-1.7B ──→ 实时转文字（~100ms）
+用户音频 ──┤
+                    └─ Qwen3-Omni-30B ──→ 异步分析：性别/年龄/情绪/购买意向
+```
+
+### 部署三个服务
+
+```bash
+# 1. ASR 服务（GPU 0）
+python deploy/deploy_local.py --model_path ./output_dpo/final --port 9000 --device cuda:0
+
+# 2. Omni 分析服务（GPU 1）
+bash deploy/deploy_omni.sh Qwen/Qwen3-Omni-30B-A3B 9001 cuda:1
+
+# 3. Pipeline 调度器
+python inference/pipeline.py --asr_url http://localhost:9000 --omni_url http://localhost:9001 --port 8080
+```
+
+### 调用
+
+```bash
+# 一次请求，ASR 同步返回，分析异步进行
+curl -X POST http://localhost:8080/recognize \
+  -H "Content-Type: application/json" \
+  -d '{
+    "audio_path": "/data/user.wav",
+    "context": "销售员：请问您需要什么产品？",
+    "need_analysis": true
+  }'
+
+# 返回：
+# {
+#   "asr": {"text": "嗯，我想了解百万医疗险", "latency_ms": 120},
+#   "analysis": {"status": "pending", "task_id": "a1b2c3d4"}
+# }
+
+# 查询分析结果
+curl http://localhost:8080/analysis/a1b2c3d4
+
+# 返回：
+# {
+#   "status": "completed",
+#   "result": {"gender": "女", "age_group": "中年", "emotion": "积极", "purchase_intent": "有兴趣"}
+# }
+```
