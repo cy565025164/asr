@@ -2,147 +2,74 @@
 
 ## 设计原则
 
-**一个基座模型，多个独立任务，每个任务独立标注、独立数据集。**
+**一个基座模型，一份训练数据，通过 prompt 区分任务。**
 
-```
-Qwen3-Omni-30B-A3B-Instruct（基座）
-  ├── 任务1: ASR 语音识别
-  ├── 任务2: 情绪识别
-  ├── 任务3: 性别识别
-  ├── 任务4: 年龄段识别
-  └── 任务N: 未来新增...
-```
-
-训练时多任务数据混合，但**各任务数据独立准备、独立标注**。
-推理时客户端**按需选择**要执行的任务组合。
+所有任务的训练样本合并到同一个 `.jsonl`，模型根据 system prompt + user prompt 来执行不同任务。
 
 ---
 
-## 任务定义 (tasks.json)
+## 标注文件格式
 
-每个任务有独立的 task_id、system prompt、输出格式：
+一条标注可以包含多个任务的标签，按需填写：
 
 ```json
 {
-  "asr": {
-    "name": "语音识别",
-    "system": "你是语音识别助手，请准确转录用户语音内容。",
-    "user_prompt": "请准确识别语音内容。",
-    "output_format": "纯文本转录"
-  },
-  "emotion": {
-    "name": "情绪识别",
-    "system": "你是语音情绪分析助手，根据说话人的语气、语调、语速判断情绪。",
-    "user_prompt": "请判断说话人的情绪状态。",
-    "output_format": "JSON: {emotion, intensity, confidence}"
-  },
-  "gender": {
-    "name": "性别识别",
-    "system": "你是语音性别识别助手，根据声音特征判断说话人性别。",
-    "user_prompt": "请判断说话人的性别。",
-    "output_format": "JSON: {gender, confidence}"
-  },
-  "age": {
-    "name": "年龄段识别",
-    "system": "你是语音年龄识别助手，根据声音特征判断说话人的大致年龄段。",
-    "user_prompt": "请判断说话人的年龄段。",
-    "output_format": "JSON: {age_group, confidence}"
-  }
+  "audio_path": "/data/audio/call_001_user_02.wav",
+  "sales_context": "请问您对我们的保险产品感兴趣吗？",
+  "text": "嗯，我想了解一下你们那个百万医疗险",
+  "emotion": "积极",
+  "emotion_intensity": "中",
+  "gender": "女",
+  "age_group": "中年"
 }
 ```
 
+- `text` → ASR 任务标签（必填）
+- `emotion` / `emotion_intensity` → 情绪任务标签（选填）
+- `gender` → 性别任务标签（选填）
+- `age_group` → 年龄任务标签（选填）
+- 有哪个标签就生成哪个任务的训练数据
+
 ---
 
-## SFT 数据格式
+## 构建后的训练数据 (train.jsonl)
 
-### 每个任务独立一个标注文件
+`build_dataset.py` 会把一条标注展开为多条训练样本（按标签有无）：
 
-**ASR 标注** (`annotations_asr.jsonl`):
-```json
-{"audio_path": "/data/audio/call_001_user_01.wav", "sales_context": "您好请问方便接听吗", "text": "嗯你好，我想了解一下保险"}
+```jsonl
+{"task":"asr","messages":[{"role":"system","content":"你是语音识别助手...销售员上一句：..."},{"role":"user","content":[{"type":"audio","audio":"..."},{"type":"text","text":"请准确识别语音内容。"}]},{"role":"assistant","content":"嗯，我想了解一下你们那个百万医疗险"}]}
+{"task":"emotion","messages":[{"role":"system","content":"你是语音情绪分析助手..."},{"role":"user","content":[{"type":"audio","audio":"..."},{"type":"text","text":"请判断说话人的情绪状态。"}]},{"role":"assistant","content":"{\"emotion\":\"积极\",\"intensity\":\"中\"}"}]}
+{"task":"gender","messages":[...]}
+{"task":"age","messages":[...]}
 ```
 
-**情绪标注** (`annotations_emotion.jsonl`):
-```json
-{"audio_path": "/data/audio/call_001_user_01.wav", "sales_context": "您好请问方便接听吗", "emotion": "平静", "intensity": "低", "confidence": 0.9}
-```
+全部混在一个文件里，直接喂给 `train_sft.py`。
 
-**性别标注** (`annotations_gender.jsonl`):
-```json
-{"audio_path": "/data/audio/call_001_user_01.wav", "gender": "女", "confidence": 0.95}
-```
+---
 
-**年龄标注** (`annotations_age.jsonl`):
-```json
-{"audio_path": "/data/audio/call_001_user_01.wav", "age_group": "中年", "confidence": 0.8}
-```
+## DPO 数据 (train_dpo.jsonl)
 
-### 构建后的 SFT 训练数据
-
-每条标注转为独立的 chat message：
+同样一个文件，`task` 字段标记任务类型：
 
 ```json
-{"task": "asr", "messages": [
-  {"role": "system", "content": "你是语音识别助手，请准确转录用户语音内容。销售员上一句：您好请问方便接听吗"},
-  {"role": "user", "content": [{"type": "audio", "audio": "/data/audio/call_001_user_01.wav"}, {"type": "text", "text": "请准确识别语音内容。"}]},
-  {"role": "assistant", "content": "嗯你好，我想了解一下保险"}
-]}
-```
-
-```json
-{"task": "emotion", "messages": [
-  {"role": "system", "content": "你是语音情绪分析助手，根据说话人的语气、语调、语速判断情绪。销售员上一句：您好请问方便接听吗"},
-  {"role": "user", "content": [{"type": "audio", "audio": "/data/audio/call_001_user_01.wav"}, {"type": "text", "text": "请判断说话人的情绪状态。"}]},
-  {"role": "assistant", "content": "{\"emotion\":\"平静\",\"intensity\":\"低\",\"confidence\":0.9}"}
-]}
+{"task":"asr","messages_prefix":[...],"chosen":"嗯，我想了解一下百万医疗险","rejected":"嗯我想了解一下百万医疗险"}
 ```
 
 ---
 
-## DPO 数据格式
-
-同样按任务独立：
-
-```json
-{"task": "asr", "messages_prefix": [...], "chosen": "嗯你好，我想了解一下保险", "rejected": "嗯你好我想了解一下保险"}
-```
-
----
-
-## 训练数据混合
-
-`build_sft_dataset.py` 将各任务数据合并，支持设置混合比例：
+## 用法
 
 ```bash
-python data/build_sft_dataset.py \
-    --tasks asr:annotations_asr.jsonl:0.5 \
-            emotion:annotations_emotion.jsonl:0.2 \
-            gender:annotations_gender.jsonl:0.15 \
-            age:annotations_age.jsonl:0.15 \
-    --output train_sft.jsonl
-```
+# 从标注文件构建 SFT 数据（一个 jsonl 出来）
+python data/build_dataset.py sft \
+    --annotations annotations.jsonl \
+    --output train.jsonl
 
----
+# 构建 DPO 数据
+python data/build_dataset.py dpo \
+    --annotations annotations.jsonl \
+    --output train_dpo.jsonl
 
-## 推理：客户端按需选择
-
-```python
-# 只要 ASR
-result = client.infer(audio, context="...", tasks=["asr"])
-
-# ASR + 情绪
-result = client.infer(audio, context="...", tasks=["asr", "emotion"])
-
-# 全部
-result = client.infer(audio, context="...", tasks=["asr", "emotion", "gender", "age"])
-```
-
-返回：
-```json
-{
-  "asr": {"text": "嗯你好，我想了解一下保险", "latency_ms": 85},
-  "emotion": {"emotion": "平静", "intensity": "低", "confidence": 0.9, "latency_ms": 92},
-  "gender": {"gender": "女", "confidence": 0.95, "latency_ms": 78},
-  "age": {"age_group": "中年", "confidence": 0.8, "latency_ms": 80}
-}
+# 训练
+python training/train_sft.py --train_file train.jsonl ...
 ```
