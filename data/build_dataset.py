@@ -1,8 +1,8 @@
 """
 统一数据集构建工具
 
-一条标注 → 按有哪些标签展开为多条训练样本 → 合并到一个 jsonl。
-模型通过 prompt 区分任务。
+每条标注自带 task 字段，直接构建对应任务的训练样本。
+所有任务混在一个 jsonl 里，模型通过 prompt 区分。
 
 用法：
     # 构建 SFT
@@ -32,20 +32,10 @@ def load_tasks_config():
         return json.load(f)
 
 
-# ============ 任务标签检测 ============
-
-def get_available_tasks(ann: dict, tasks_config: dict) -> list:
-    """检测一条标注中有哪些任务的标签"""
-    available = []
-    for task_id, cfg in tasks_config.items():
-        fields = cfg.get("annotation_fields", [])
-        if all(f in ann and ann[f] is not None for f in fields):
-            available.append(task_id)
-    return available
-
+# ============ 构建训练样本 ============
 
 def build_assistant_output(task_id: str, task_cfg: dict, ann: dict) -> str:
-    """根据任务和标注构建 assistant 回复"""
+    """根据任务类型构建 assistant 回复"""
     if task_cfg["output_type"] == "text":
         return ann["text"]
     output = {}
@@ -76,13 +66,19 @@ def build_messages(task_id: str, task_cfg: dict, ann: dict) -> list:
 
 def build_sft(annotations, tasks_config):
     items = []
+    skipped = 0
     for ann in annotations:
-        for task_id in get_available_tasks(ann, tasks_config):
-            task_cfg = tasks_config[task_id]
-            items.append({
-                "task": task_id,
-                "messages": build_messages(task_id, task_cfg, ann),
-            })
+        task_id = ann.get("task")
+        if not task_id or task_id not in tasks_config:
+            skipped += 1
+            continue
+        task_cfg = tasks_config[task_id]
+        items.append({
+            "task": task_id,
+            "messages": build_messages(task_id, task_cfg, ann),
+        })
+    if skipped:
+        logger.warning(f"Skipped {skipped} entries (missing/unknown task)")
     return items
 
 
@@ -112,23 +108,25 @@ def _drop_char(t):
     return "".join(chars)
 
 
-def build_dpo(annotations, tasks_config, model_path=None):
+def build_dpo(annotations, tasks_config):
     items = []
     for ann in annotations:
-        for task_id in get_available_tasks(ann, tasks_config):
-            task_cfg = tasks_config[task_id]
-            chosen = build_assistant_output(task_id, task_cfg, ann)
-            rejected = perturb_text(chosen)
-            if rejected.strip() == chosen.strip():
-                continue
+        task_id = ann.get("task")
+        if not task_id or task_id not in tasks_config:
+            continue
+        task_cfg = tasks_config[task_id]
+        chosen = build_assistant_output(task_id, task_cfg, ann)
+        rejected = perturb_text(chosen)
+        if rejected.strip() == chosen.strip():
+            continue
 
-            msgs = build_messages(task_id, task_cfg, ann)
-            items.append({
-                "task": task_id,
-                "messages_prefix": msgs[:2],  # system + user
-                "chosen": chosen,
-                "rejected": rejected,
-            })
+        msgs = build_messages(task_id, task_cfg, ann)
+        items.append({
+            "task": task_id,
+            "messages_prefix": msgs[:2],  # system + user
+            "chosen": chosen,
+            "rejected": rejected,
+        })
     return items
 
 
@@ -146,40 +144,37 @@ def build_dpo_with_model(annotations, tasks_config, model_path):
     processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
 
     items = []
-    total = sum(len(get_available_tasks(a, tasks_config)) for a in annotations)
-    count = 0
+    valid = [(a, a["task"]) for a in annotations if a.get("task") in tasks_config]
 
-    for ann in annotations:
-        for task_id in get_available_tasks(ann, tasks_config):
-            task_cfg = tasks_config[task_id]
-            chosen = build_assistant_output(task_id, task_cfg, ann)
-            msgs = build_messages(task_id, task_cfg, ann)
-            prefix_msgs = msgs[:2]
+    for i, (ann, task_id) in enumerate(valid):
+        task_cfg = tasks_config[task_id]
+        chosen = build_assistant_output(task_id, task_cfg, ann)
+        msgs = build_messages(task_id, task_cfg, ann)
+        prefix_msgs = msgs[:2]
 
-            text = processor.apply_chat_template(prefix_msgs, add_generation_prompt=True, tokenize=False)
-            audios, images, videos = process_mm_info(prefix_msgs, use_audio_in_video=False)
-            inputs = processor(text=text, audio=audios, images=images, videos=videos,
-                              return_tensors="pt", padding=True)
-            inputs = inputs.to(model.device).to(model.dtype)
+        text = processor.apply_chat_template(prefix_msgs, add_generation_prompt=True, tokenize=False)
+        audios, images, videos = process_mm_info(prefix_msgs, use_audio_in_video=False)
+        inputs = processor(text=text, audio=audios, images=images, videos=videos,
+                          return_tensors="pt", padding=True)
+        inputs = inputs.to(model.device).to(model.dtype)
 
-            with torch.no_grad():
-                text_ids, _ = model.generate(**inputs, return_audio=False,
-                                             thinker_return_dict_in_generate=True, max_new_tokens=256)
-            output = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1]:],
-                                            skip_special_tokens=True)[0].strip()
+        with torch.no_grad():
+            text_ids, _ = model.generate(**inputs, return_audio=False,
+                                         thinker_return_dict_in_generate=True, max_new_tokens=256)
+        output = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1]:],
+                                        skip_special_tokens=True)[0].strip()
 
-            rejected = output if output.strip() != chosen.strip() else perturb_text(chosen)
-            if rejected.strip() != chosen.strip():
-                items.append({
-                    "task": task_id,
-                    "messages_prefix": prefix_msgs,
-                    "chosen": chosen,
-                    "rejected": rejected,
-                })
+        rejected = output if output.strip() != chosen.strip() else perturb_text(chosen)
+        if rejected.strip() != chosen.strip():
+            items.append({
+                "task": task_id,
+                "messages_prefix": prefix_msgs,
+                "chosen": chosen,
+                "rejected": rejected,
+            })
 
-            count += 1
-            if count % 10 == 0:
-                logger.info(f"  {count}/{total}")
+        if (i + 1) % 10 == 0:
+            logger.info(f"  {i+1}/{len(valid)}")
 
     return items
 
@@ -209,7 +204,6 @@ def main():
     random.seed(args.seed)
     tasks_config = load_tasks_config()
 
-    # 加载标注
     annotations = []
     with open(args.annotations, "r", encoding="utf-8") as f:
         for line in f:
@@ -219,19 +213,17 @@ def main():
 
     if args.cmd == "sft":
         items = build_sft(annotations, tasks_config)
-        random.shuffle(items)
     elif args.cmd == "dpo":
         if args.model_path:
             items = build_dpo_with_model(annotations, tasks_config, args.model_path)
         else:
             items = build_dpo(annotations, tasks_config)
-        random.shuffle(items)
 
+    random.shuffle(items)
     with open(args.output, "w", encoding="utf-8") as f:
         for item in items:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-    # 统计
     task_counts = {}
     for item in items:
         t = item["task"]
