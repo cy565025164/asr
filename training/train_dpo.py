@@ -238,6 +238,8 @@ def parse_args():
     p.add_argument("--save_total_limit", type=int, default=3)
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
+    p.add_argument("--deepspeed", type=str, default=None)
+    p.add_argument("--local_rank", type=int, default=-1)
     return p.parse_args()
 
 
@@ -295,6 +297,7 @@ def main():
         remove_unused_columns=False,
         report_to="none",
         gradient_checkpointing=True,
+        deepspeed=args.deepspeed,
     )
 
     trainer = DPOTrainer(
