@@ -79,16 +79,22 @@ def load_annotations_from_dir(data_dir: str) -> list:
                         skipped += 1
                         continue
 
-                    ann = {
-                        "task": "asr",
+                    gender = row.get("性别", "").strip()
+                    base = {
                         "audio_path": str(audio_path),
                         "text": text,
                         "sales_context": row.get("context", "").strip(),
                         "model_text": row.get("model_text", "").strip(),
-                        "gender": row.get("性别", "").strip(),
+                        "gender": gender,
                         "uncertain": row.get("文本拿不准", "").strip(),
                     }
-                    annotations.append(ann)
+
+                    # ASR 任务
+                    annotations.append({**base, "task": "asr"})
+
+                    # 性别识别任务
+                    if gender:
+                        annotations.append({**base, "task": "gender"})
 
     if skipped:
         logger.warning(f"Skipped {skipped} entries (missing fields or audio file)")
@@ -195,11 +201,30 @@ def _drop_char(t):
     return "".join(chars)
 
 
+GENDER_OPPOSITES = {"男": "女", "女": "男"}
+
+
+def _make_rejected(task_id, task_cfg, ann, chosen):
+    """根据任务类型生成 rejected"""
+    if task_id == "gender":
+        # 性别任务：取反
+        gender = ann.get("gender", "").strip()
+        opposite = GENDER_OPPOSITES.get(gender)
+        if opposite:
+            return json.dumps({"gender": opposite}, ensure_ascii=False), "flip"
+        return chosen, "skip"
+
+    # ASR 等文本任务：优先 model_text，fallback 扰动
+    model_text = ann.get("model_text", "").strip()
+    if model_text and model_text != chosen.strip():
+        return model_text, "model"
+    return perturb_text(chosen), "perturb"
+
+
 def build_dpo(annotations, tasks_config):
     """构建 DPO 数据，优先用 CSV 中的 model_text 作为 rejected，缺失时文本扰动"""
     items = []
-    from_model = 0
-    from_perturb = 0
+    source_counts = {}
 
     for ann in annotations:
         task_id = ann.get("task")
@@ -208,14 +233,8 @@ def build_dpo(annotations, tasks_config):
         task_cfg = tasks_config[task_id]
         chosen = build_assistant_output(task_id, task_cfg, ann)
 
-        # 优先用标注数据中的 model_text 作为 rejected
-        model_text = ann.get("model_text", "").strip()
-        if model_text and model_text != chosen.strip():
-            rejected = model_text
-            from_model += 1
-        else:
-            rejected = perturb_text(chosen)
-            from_perturb += 1
+        rejected, source = _make_rejected(task_id, task_cfg, ann, chosen)
+        source_counts[source] = source_counts.get(source, 0) + 1
 
         # chosen == rejected 时用扰动兜底，尽量保留数据
         if rejected.strip() == chosen.strip():
@@ -231,7 +250,7 @@ def build_dpo(annotations, tasks_config):
             "rejected": rejected,
         })
 
-    logger.info(f"DPO sources: {from_model} from model_text, {from_perturb} from perturbation")
+    logger.info(f"DPO sources: {source_counts}")
     return items
 
 
