@@ -44,7 +44,7 @@ def load_tasks_config():
 
 # ============ 数据加载 ============
 
-def load_annotations_from_dir(data_dir: str) -> list:
+def load_annotations_from_dir(data_dir: str, task_filter: set = None) -> list:
     """从数据目录批量读取所有子文件夹中的 CSV 标注"""
     data_path = Path(data_dir)
     annotations = []
@@ -89,11 +89,10 @@ def load_annotations_from_dir(data_dir: str) -> list:
                         "uncertain": row.get("文本拿不准", "").strip(),
                     }
 
-                    # ASR 任务
-                    annotations.append({**base, "task": "asr"})
-
-                    # 性别识别任务
-                    if gender:
+                    # 根据 task_filter 决定生成哪些任务
+                    if task_filter is None or "asr" in task_filter:
+                        annotations.append({**base, "task": "asr"})
+                    if gender and (task_filter is None or "gender" in task_filter):
                         annotations.append({**base, "task": "gender"})
 
     if skipped:
@@ -104,8 +103,10 @@ def load_annotations_from_dir(data_dir: str) -> list:
 
 def load_annotations(args) -> list:
     """根据参数加载标注：支持 --data_dir（CSV文件夹）和 --annotations（jsonl，兼容旧格式）"""
+    task_filter = set(args.task) if hasattr(args, "task") and args.task else None
+
     if hasattr(args, "data_dir") and args.data_dir:
-        return load_annotations_from_dir(args.data_dir)
+        return load_annotations_from_dir(args.data_dir, task_filter)
 
     annotations = []
     with open(args.annotations, "r", encoding="utf-8") as f:
@@ -318,11 +319,13 @@ def main():
 
     sft_p = sub.add_parser("sft", help="构建 SFT 数据")
     add_data_args(sft_p)
+    sft_p.add_argument("--task", nargs="+", help="指定任务类型，如 asr gender（默认全部）")
     sft_p.add_argument("--output", default="train.jsonl")
     sft_p.add_argument("--seed", type=int, default=42)
 
     dpo_p = sub.add_parser("dpo", help="构建 DPO 数据")
     add_data_args(dpo_p)
+    dpo_p.add_argument("--task", nargs="+", help="指定任务类型，如 asr gender（默认全部）")
     dpo_p.add_argument("--output", default="train_dpo.jsonl")
     dpo_p.add_argument("--model_path", default=None)
     dpo_p.add_argument("--seed", type=int, default=42)
