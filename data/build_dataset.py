@@ -1,20 +1,30 @@
 """
 统一数据集构建工具
 
-每条标注自带 task 字段，直接构建对应任务的训练样本。
-所有任务混在一个 jsonl 里，模型通过 prompt 区分。
+支持从标注文件夹批量读取 CSV + 音频，构建 SFT / DPO 训练数据。
+
+数据目录结构：
+    data_dir/
+    ├── batch_001/
+    │   ├── *.csv          # 标注文件（audio_id, audio_name, text, 文本拿不准, 性别, context, model_text）
+    │   └── audios/
+    │       └── {audio_id}/
+    │           └── {audio_name}
+    ├── batch_002/
+    │   ├── ...
 
 用法：
     # 构建 SFT
-    python build_dataset.py sft --annotations annotations.jsonl --output train.jsonl
+    python build_dataset.py sft --data_dir /path/to/data --output train.jsonl
 
-    # 构建 DPO（文本扰动）
-    python build_dataset.py dpo --annotations annotations.jsonl --output train_dpo.jsonl
+    # 构建 DPO（使用 CSV 中的 model_text 作为 rejected，缺失时文本扰动）
+    python build_dataset.py dpo --data_dir /path/to/data --output train_dpo.jsonl
 
     # 构建 DPO（模型推理生成 rejected）
-    python build_dataset.py dpo --annotations annotations.jsonl --model_path ./output_sft/final --output train_dpo.jsonl
+    python build_dataset.py dpo --data_dir /path/to/data --model_path ./output_sft/final --output train_dpo.jsonl
 """
 
+import csv
 import json
 import random
 import argparse
@@ -30,6 +40,74 @@ TASKS_FILE = Path(__file__).parent / "tasks.json"
 def load_tasks_config():
     with open(TASKS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+# ============ 数据加载 ============
+
+def load_annotations_from_dir(data_dir: str) -> list:
+    """从数据目录批量读取所有子文件夹中的 CSV 标注"""
+    data_path = Path(data_dir)
+    annotations = []
+    skipped = 0
+
+    for subfolder in sorted(data_path.iterdir()):
+        if not subfolder.is_dir():
+            continue
+
+        # 找 CSV 文件
+        csv_files = list(subfolder.glob("*.csv"))
+        if not csv_files:
+            logger.warning(f"No CSV found in {subfolder.name}, skipping")
+            continue
+
+        audios_dir = subfolder / "audios"
+
+        for csv_file in csv_files:
+            with open(csv_file, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    audio_id = row.get("audio_id", "").strip()
+                    audio_name = row.get("audio_name", "").strip()
+                    text = row.get("text", "").strip()
+
+                    if not audio_id or not audio_name or not text:
+                        skipped += 1
+                        continue
+
+                    audio_path = audios_dir / audio_id / audio_name
+                    if not audio_path.exists():
+                        skipped += 1
+                        continue
+
+                    ann = {
+                        "task": "asr",
+                        "audio_path": str(audio_path),
+                        "text": text,
+                        "sales_context": row.get("context", "").strip(),
+                        "model_text": row.get("model_text", "").strip(),
+                        "gender": row.get("性别", "").strip(),
+                        "uncertain": row.get("文本拿不准", "").strip(),
+                    }
+                    annotations.append(ann)
+
+    if skipped:
+        logger.warning(f"Skipped {skipped} entries (missing fields or audio file)")
+    logger.info(f"Loaded {len(annotations)} annotations from {data_dir}")
+    return annotations
+
+
+def load_annotations(args) -> list:
+    """根据参数加载标注：支持 --data_dir（CSV文件夹）和 --annotations（jsonl，兼容旧格式）"""
+    if hasattr(args, "data_dir") and args.data_dir:
+        return load_annotations_from_dir(args.data_dir)
+
+    annotations = []
+    with open(args.annotations, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                annotations.append(json.loads(line))
+    logger.info(f"Loaded {len(annotations)} annotations from {args.annotations}")
+    return annotations
 
 
 # ============ 构建训练样本 ============
@@ -48,7 +126,6 @@ def build_assistant_output(task_id: str, task_cfg: dict, ann: dict) -> str:
 def build_messages(task_id: str, task_cfg: dict, ann: dict) -> list:
     """构建 chat messages"""
     system_text = task_cfg["system"]
-    # 只有 ASR 等需要上下文的任务才注入销售员话术
     if task_cfg.get("use_context", False):
         sales_ctx = ann.get("sales_context", "")
         if sales_ctx:
@@ -93,6 +170,7 @@ def perturb_text(text: str) -> str:
         result = fn(result)
     return result
 
+
 def _remove_punct(t):
     """随机去掉部分标点（而非全部），让 rejected 更贴近真实错误"""
     punct_set = set("，。！？、；：""''（）,.")
@@ -101,12 +179,14 @@ def _remove_punct(t):
         if c not in punct_set or random.random() > 0.5
     )
 
+
 def _swap_chars(t):
     chars = list(t)
     if len(chars) >= 4:
         i = random.randint(1, len(chars) - 3)
-        chars[i], chars[i+1] = chars[i+1], chars[i]
+        chars[i], chars[i + 1] = chars[i + 1], chars[i]
     return "".join(chars)
+
 
 def _drop_char(t):
     chars = list(t)
@@ -116,14 +196,27 @@ def _drop_char(t):
 
 
 def build_dpo(annotations, tasks_config):
+    """构建 DPO 数据，优先用 CSV 中的 model_text 作为 rejected，缺失时文本扰动"""
     items = []
+    from_model = 0
+    from_perturb = 0
+
     for ann in annotations:
         task_id = ann.get("task")
         if not task_id or task_id not in tasks_config:
             continue
         task_cfg = tasks_config[task_id]
         chosen = build_assistant_output(task_id, task_cfg, ann)
-        rejected = perturb_text(chosen)
+
+        # 优先用标注数据中的 model_text 作为 rejected
+        model_text = ann.get("model_text", "").strip()
+        if model_text and model_text != chosen.strip():
+            rejected = model_text
+            from_model += 1
+        else:
+            rejected = perturb_text(chosen)
+            from_perturb += 1
+
         if rejected.strip() == chosen.strip():
             continue
 
@@ -134,6 +227,8 @@ def build_dpo(annotations, tasks_config):
             "chosen": chosen,
             "rejected": rejected,
         })
+
+    logger.info(f"DPO sources: {from_model} from model_text, {from_perturb} from perturbation")
     return items
 
 
@@ -162,7 +257,7 @@ def build_dpo_with_model(annotations, tasks_config, model_path):
         text = processor.apply_chat_template(prefix_msgs, add_generation_prompt=True, tokenize=False)
         audios, images, videos = process_mm_info(prefix_msgs, use_audio_in_video=False)
         inputs = processor(text=text, audio=audios, images=images, videos=videos,
-                          return_tensors="pt", padding=True)
+                           return_tensors="pt", padding=True)
         inputs = inputs.to(model.device).to(model.dtype)
 
         with torch.no_grad():
@@ -188,17 +283,24 @@ def build_dpo_with_model(annotations, tasks_config, model_path):
 
 # ============ 主入口 ============
 
+def add_data_args(parser):
+    """添加数据源参数（互斥：--data_dir 或 --annotations）"""
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--data_dir", help="标注数据根目录（含多个子文件夹，每个有 CSV + audios/）")
+    group.add_argument("--annotations", help="标注 jsonl 文件（兼容旧格式）")
+
+
 def main():
     p = argparse.ArgumentParser("统一数据集构建")
     sub = p.add_subparsers(dest="cmd")
 
     sft_p = sub.add_parser("sft", help="构建 SFT 数据")
-    sft_p.add_argument("--annotations", required=True)
+    add_data_args(sft_p)
     sft_p.add_argument("--output", default="train.jsonl")
     sft_p.add_argument("--seed", type=int, default=42)
 
     dpo_p = sub.add_parser("dpo", help="构建 DPO 数据")
-    dpo_p.add_argument("--annotations", required=True)
+    add_data_args(dpo_p)
     dpo_p.add_argument("--output", default="train_dpo.jsonl")
     dpo_p.add_argument("--model_path", default=None)
     dpo_p.add_argument("--seed", type=int, default=42)
@@ -210,13 +312,7 @@ def main():
 
     random.seed(args.seed)
     tasks_config = load_tasks_config()
-
-    annotations = []
-    with open(args.annotations, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                annotations.append(json.loads(line))
-    logger.info(f"Loaded {len(annotations)} annotations")
+    annotations = load_annotations(args)
 
     if args.cmd == "sft":
         items = build_sft(annotations, tasks_config)
