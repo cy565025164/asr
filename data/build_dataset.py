@@ -1,27 +1,33 @@
 """
 统一数据集构建工具
 
-支持从标注文件夹批量读取 CSV + 音频，构建 SFT / DPO 训练数据。
+从项目 datasets/ 目录读取标注数据，构建 SFT / DPO 训练数据。
 
 数据目录结构：
-    data_dir/
+    datasets/
     ├── batch_001/
-    │   ├── *.csv          # 标注文件（audio_id, audio_name, text, 文本拿不准, 性别, context, model_text）
+    │   ├── 训练数据.csv    # 标注文件（audio_id, audio_name, text, 文本拿不准, 性别, context, model_text）
     │   └── audios/
     │       └── {audio_id}/
     │           └── {audio_name}
     ├── batch_002/
-    │   ├── ...
+    │   ├── 训练数据.csv
+    │   └── audios/
+    └── ...
 
 用法：
-    # 构建 SFT
+    # 构建 SFT（默认读取 datasets/）
+    python build_dataset.py sft --output train.jsonl
+    python build_dataset.py sft --task asr --output train_asr.jsonl
+
+    # 构建 DPO
+    python build_dataset.py dpo --task asr --output dpo_asr.jsonl
+
+    # 指定其他数据目录
     python build_dataset.py sft --data_dir /path/to/data --output train.jsonl
 
-    # 构建 DPO（使用 CSV 中的 model_text 作为 rejected，缺失时文本扰动）
-    python build_dataset.py dpo --data_dir /path/to/data --output train_dpo.jsonl
-
-    # 构建 DPO（模型推理生成 rejected）
-    python build_dataset.py dpo --data_dir /path/to/data --model_path ./output_sft/final --output train_dpo.jsonl
+    # 兼容旧格式 jsonl
+    python build_dataset.py sft --annotations annotations.jsonl --output train.jsonl
 """
 
 import csv
@@ -44,8 +50,11 @@ def load_tasks_config():
 
 # ============ 数据加载 ============
 
+DATASETS_DIR = Path(__file__).parent.parent / "datasets"
+
+
 def load_annotations_from_dir(data_dir: str, task_filter: set = None) -> list:
-    """从数据目录批量读取所有子文件夹中的 CSV 标注"""
+    """从数据目录批量读取所有子文件夹中的 训练数据.csv"""
     data_path = Path(data_dir)
     annotations = []
     skipped = 0
@@ -54,46 +63,45 @@ def load_annotations_from_dir(data_dir: str, task_filter: set = None) -> list:
         if not subfolder.is_dir():
             continue
 
-        # 找 CSV 文件
-        csv_files = list(subfolder.glob("*.csv"))
-        if not csv_files:
-            logger.warning(f"No CSV found in {subfolder.name}, skipping")
+        # 只读 训练数据.csv
+        csv_file = subfolder / "训练数据.csv"
+        if not csv_file.exists():
+            logger.warning(f"No 训练数据.csv in {subfolder.name}, skipping")
             continue
 
         audios_dir = subfolder / "audios"
 
-        for csv_file in csv_files:
-            with open(csv_file, "r", encoding="utf-8-sig") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    audio_id = row.get("audio_id", "").strip()
-                    audio_name = row.get("audio_name", "").strip()
-                    text = row.get("text", "").strip()
+        with open(csv_file, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                audio_id = row.get("audio_id", "").strip()
+                audio_name = row.get("audio_name", "").strip()
+                text = row.get("text", "").strip()
 
-                    if not audio_id or not audio_name or not text:
-                        skipped += 1
-                        continue
+                if not audio_id or not audio_name or not text:
+                    skipped += 1
+                    continue
 
-                    audio_path = audios_dir / audio_id / audio_name
-                    if not audio_path.exists():
-                        skipped += 1
-                        continue
+                audio_path = audios_dir / audio_id / audio_name
+                if not audio_path.exists():
+                    skipped += 1
+                    continue
 
-                    gender = row.get("性别", "").strip()
-                    base = {
-                        "audio_path": str(audio_path),
-                        "text": text,
-                        "sales_context": row.get("context", "").strip(),
-                        "model_text": row.get("model_text", "").strip(),
-                        "gender": gender,
-                        "uncertain": row.get("文本拿不准", "").strip(),
-                    }
+                gender = row.get("性别", "").strip()
+                base = {
+                    "audio_path": str(audio_path),
+                    "text": text,
+                    "sales_context": row.get("context", "").strip(),
+                    "model_text": row.get("model_text", "").strip(),
+                    "gender": gender,
+                    "uncertain": row.get("文本拿不准", "").strip(),
+                }
 
-                    # 根据 task_filter 决定生成哪些任务
-                    if task_filter is None or "asr" in task_filter:
-                        annotations.append({**base, "task": "asr"})
-                    if gender and (task_filter is None or "gender" in task_filter):
-                        annotations.append({**base, "task": "gender"})
+                # 根据 task_filter 决定生成哪些任务
+                if task_filter is None or "asr" in task_filter:
+                    annotations.append({**base, "task": "asr"})
+                if gender and (task_filter is None or "gender" in task_filter):
+                    annotations.append({**base, "task": "gender"})
 
     if skipped:
         logger.warning(f"Skipped {skipped} entries (missing fields or audio file)")
@@ -105,16 +113,18 @@ def load_annotations(args) -> list:
     """根据参数加载标注：支持 --data_dir（CSV文件夹）和 --annotations（jsonl，兼容旧格式）"""
     task_filter = set(args.task) if hasattr(args, "task") and args.task else None
 
-    if hasattr(args, "data_dir") and args.data_dir:
-        return load_annotations_from_dir(args.data_dir, task_filter)
+    # --annotations 优先，否则用 --data_dir，都没指定则默认 datasets/
+    if hasattr(args, "annotations") and args.annotations:
+        annotations = []
+        with open(args.annotations, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    annotations.append(json.loads(line))
+        logger.info(f"Loaded {len(annotations)} annotations from {args.annotations}")
+        return annotations
 
-    annotations = []
-    with open(args.annotations, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                annotations.append(json.loads(line))
-    logger.info(f"Loaded {len(annotations)} annotations from {args.annotations}")
-    return annotations
+    data_dir = args.data_dir if (hasattr(args, "data_dir") and args.data_dir) else str(DATASETS_DIR)
+    return load_annotations_from_dir(data_dir, task_filter)
 
 
 # ============ 构建训练样本 ============
@@ -307,10 +317,11 @@ def build_dpo_with_model(annotations, tasks_config, model_path):
 # ============ 主入口 ============
 
 def add_data_args(parser):
-    """添加数据源参数（互斥：--data_dir 或 --annotations）"""
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--data_dir", help="标注数据根目录（含多个子文件夹，每个有 CSV + audios/）")
-    group.add_argument("--annotations", help="标注 jsonl 文件（兼容旧格式）")
+    """添加数据源参数：--data_dir（默认 datasets/）或 --annotations（jsonl 旧格式）"""
+    parser.add_argument("--data_dir", default=None,
+                        help="标注数据根目录（默认项目下 datasets/）")
+    parser.add_argument("--annotations", default=None,
+                        help="标注 jsonl 文件（兼容旧格式）")
 
 
 def main():

@@ -7,3 +7,4 @@ output_*/
 *.safetensors
 wandb/
 logs/
+datasets/
