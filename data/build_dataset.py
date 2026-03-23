@@ -217,6 +217,9 @@ def build_dpo(annotations, tasks_config):
             rejected = perturb_text(chosen)
             from_perturb += 1
 
+        # chosen == rejected 时用扰动兜底，尽量保留数据
+        if rejected.strip() == chosen.strip():
+            rejected = perturb_text(chosen)
         if rejected.strip() == chosen.strip():
             continue
 
