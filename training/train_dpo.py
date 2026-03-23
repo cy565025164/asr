@@ -251,7 +251,7 @@ def main():
     # Policy model
     print(f"[INFO] Loading policy model from {args.model_path}")
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
-        args.model_path, dtype=dtype, device_map=None, attn_implementation="flash_attention_2",
+        args.model_path, dtype=dtype, device_map=None, attn_implementation="sdpa",
     )
     model.disable_talker()
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.model_path)
@@ -260,7 +260,7 @@ def main():
     # Reference model
     print(f"[INFO] Loading reference model")
     ref_model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
-        args.model_path, dtype=dtype, device_map=None, attn_implementation="flash_attention_2",
+        args.model_path, dtype=dtype, device_map=None, attn_implementation="sdpa",
     )
     ref_model.disable_talker()
     ref_model.eval()

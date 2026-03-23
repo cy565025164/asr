@@ -204,7 +204,7 @@ def main():
         args.model_path,
         dtype=torch.bfloat16 if use_bf16 else torch.float16,
         device_map=None,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     )
     model.disable_talker()
 

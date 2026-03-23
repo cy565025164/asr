@@ -273,7 +273,7 @@ def build_dpo_with_model(annotations, tasks_config, model_path):
 
     logger.info(f"Loading model from {model_path}")
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
-        model_path, dtype="auto", device_map="auto", attn_implementation="flash_attention_2"
+        model_path, dtype="auto", device_map="auto", attn_implementation="sdpa"
     )
     model.disable_talker()
     processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
