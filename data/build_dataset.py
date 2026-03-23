@@ -94,7 +94,12 @@ def perturb_text(text: str) -> str:
     return result
 
 def _remove_punct(t):
-    return "".join(c for c in t if c not in "，。！？、；：""''（）,.")
+    """随机去掉部分标点（而非全部），让 rejected 更贴近真实错误"""
+    punct_set = set("，。！？、；：""''（）,.")
+    return "".join(
+        c for c in t
+        if c not in punct_set or random.random() > 0.5
+    )
 
 def _swap_chars(t):
     chars = list(t)
