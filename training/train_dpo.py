@@ -260,7 +260,7 @@ def main():
     # 这样 DeepSpeed 能正确包装和管理参数
     thinker = model.thinker
     thinker.gradient_checkpointing_enable()
-    thinker.config = model.config  # Trainer 需要 config
+    # thinker 自带 config（Qwen3OmniMoeThinkerConfig），不要覆盖
 
     # Reference model — 同样只取 thinker
     print(f"[INFO] Loading reference model")
