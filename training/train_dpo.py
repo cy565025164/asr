@@ -360,6 +360,7 @@ def parse_args():
     p.add_argument("--save_total_limit", type=int, default=3)
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
+    p.add_argument("--precompute_ref", action="store_true", help="仅预计算 ref logprobs 后退出（单卡运行，不用 torchrun）")
     p.add_argument("--max_nums", type=int, default=0, help="最大训练样本数，0=全部（调试用）")
     p.add_argument("--max_length", type=int, default=2048, help="最大序列长度，超出截断（防 OOM）")
     p.add_argument("--deepspeed", type=str, default=None)
@@ -392,37 +393,44 @@ def main():
         ds["train"] = ds["train"].select(range(min(args.max_nums, len(ds["train"]))))
         print(f"[INFO] Limiting training data to {len(ds['train'])} samples")
 
-    # ---- 预计算 ref logprobs（仅 rank 0 计算，其余等文件） ----
+    # ---- 预计算 ref logprobs ----
     cache_path = os.path.join(args.output_dir, "ref_logprobs.pt")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if local_rank == 0:
-        if os.path.exists(cache_path):
-            print(f"[INFO] Loading cached ref logprobs from {cache_path}")
-            cached = torch.load(cache_path, weights_only=True)
-            ref_chosen_lps = cached["ref_chosen_logprobs"]
-            ref_rejected_lps = cached["ref_rejected_logprobs"]
-        else:
-            ref_chosen_lps, ref_rejected_lps = precompute_ref_logprobs(
-                args.model_path, dtype, processor, ds["train"], max_length=args.max_length
-            )
-            torch.save({
-                "ref_chosen_logprobs": ref_chosen_lps,
-                "ref_rejected_logprobs": ref_rejected_lps,
-            }, cache_path)
-            print(f"[INFO] Ref logprobs cached to {cache_path}")
-    else:
-        # 其他 rank 等待 rank 0 写完缓存文件
-        import time
-        print(f"[INFO] Rank {local_rank} waiting for ref logprobs cache...")
-        while not os.path.exists(cache_path):
-            time.sleep(5)
-        # 等文件写完（简单等一下确保不读到半截文件）
-        time.sleep(3)
-        cached = torch.load(cache_path, weights_only=True)
-        ref_chosen_lps = cached["ref_chosen_logprobs"]
-        ref_rejected_lps = cached["ref_rejected_logprobs"]
-        print(f"[INFO] Rank {local_rank} loaded ref logprobs cache.")
+    if args.precompute_ref:
+        # 单卡模式：计算 ref logprobs 并缓存，然后退出
+        print(f"[INFO] Precompute mode: computing ref logprobs for {len(ds['train'])} samples...")
+        ref_chosen_lps, ref_rejected_lps = precompute_ref_logprobs(
+            args.model_path, dtype, processor, ds["train"], max_length=args.max_length
+        )
+        torch.save({
+            "ref_chosen_logprobs": ref_chosen_lps,
+            "ref_rejected_logprobs": ref_rejected_lps,
+        }, cache_path)
+        print(f"[done] Ref logprobs cached to {cache_path}")
+        return
+
+    # 训练模式：必须有缓存文件
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f"Ref logprobs cache not found: {cache_path}\n"
+            f"请先单卡运行预计算：\n"
+            f"  python train_dpo.py --precompute_ref --model_path {args.model_path} "
+            f"--train_file {args.train_file} --output_dir {args.output_dir} "
+            f"--max_length {args.max_length}"
+            + (f" --max_nums {args.max_nums}" if args.max_nums > 0 else "")
+        )
+
+    print(f"[INFO] Loading cached ref logprobs from {cache_path}")
+    cached = torch.load(cache_path, weights_only=True)
+    ref_chosen_lps = cached["ref_chosen_logprobs"]
+    ref_rejected_lps = cached["ref_rejected_logprobs"]
+
+    if len(ref_chosen_lps) != len(ds["train"]):
+        raise ValueError(
+            f"Ref logprobs count ({len(ref_chosen_lps)}) != training samples ({len(ds['train'])}). "
+            f"请删除 {cache_path} 后重新预计算。"
+        )
 
     # 把 ref logprobs 加到 dataset
     ds["train"] = ds["train"].add_column("ref_chosen_logprobs", ref_chosen_lps)
