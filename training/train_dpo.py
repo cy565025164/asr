@@ -272,6 +272,9 @@ def main():
     ref_thinker.eval()
     for p in ref_thinker.parameters():
         p.requires_grad = False
+    # ref 不经过 DeepSpeed，需要手动放到对应 GPU
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    ref_thinker = ref_thinker.to(f"cuda:{local_rank}")
 
     # 数据
     raw_ds = load_dataset("json", data_files={
