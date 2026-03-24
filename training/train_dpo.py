@@ -101,7 +101,7 @@ def _compute_logprobs_single(thinker, input_ids, attention_mask, labels, extra):
     return (per_token * mask).sum(-1).item()
 
 
-def precompute_ref_logprobs(model_path, dtype, processor, dataset):
+def precompute_ref_logprobs(model_path, dtype, processor, dataset, max_length=2048):
     """
     加载 ref model，逐条计算 chosen/rejected 的 logprobs，然后释放模型。
     返回两个 list: ref_chosen_logprobs, ref_rejected_logprobs
@@ -140,14 +140,16 @@ def precompute_ref_logprobs(model_path, dtype, processor, dataset):
         # prefix 长度
         prefix_enc = processor(
             text=[prefix_text], audio=flat_audios,
-            return_tensors="pt", padding=False, truncation=False,
+            return_tensors="pt", padding=False, truncation=True,
+            max_length=max_length,
         )
         prefix_len = prefix_enc["attention_mask"].sum().item()
 
         for text, lp_list in [(chosen_text, ref_chosen_lps), (rejected_text, ref_rejected_lps)]:
             enc = processor(
                 text=[text], audio=flat_audios,
-                return_tensors="pt", padding=False, truncation=False,
+                return_tensors="pt", padding=False, truncation=True,
+                max_length=max_length,
             )
             input_ids = enc["input_ids"].to(device)
             attention_mask = enc["attention_mask"].to(device)
@@ -185,6 +187,7 @@ def precompute_ref_logprobs(model_path, dtype, processor, dataset):
 class DataCollatorForDPO:
     """DPO 数据整理器：为 chosen/rejected 分别构建输入，附带预计算的 ref logprobs"""
     processor: Qwen3OmniMoeProcessor
+    max_length: int = 2048
 
     def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
         prefix_texts = [f["prefix_text"] for f in features]
@@ -207,15 +210,18 @@ class DataCollatorForDPO:
 
         chosen_inputs = self.processor(
             text=chosen_texts, audio=flat_audios,
-            return_tensors="pt", padding=True, truncation=False,
+            return_tensors="pt", padding=True, truncation=True,
+            max_length=self.max_length,
         )
         rejected_inputs = self.processor(
             text=rejected_texts, audio=flat_audios,
-            return_tensors="pt", padding=True, truncation=False,
+            return_tensors="pt", padding=True, truncation=True,
+            max_length=self.max_length,
         )
         prefix_inputs = self.processor(
             text=prefix_texts, audio=flat_audios,
-            return_tensors="pt", padding=True, truncation=False,
+            return_tensors="pt", padding=True, truncation=True,
+            max_length=self.max_length,
         )
 
         prefix_lens = prefix_inputs["attention_mask"].sum(dim=1).tolist()
@@ -350,6 +356,7 @@ def parse_args():
     p.add_argument("--save_total_limit", type=int, default=3)
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
+    p.add_argument("--max_length", type=int, default=2048, help="最大序列长度，超出截断（防 OOM）")
     p.add_argument("--deepspeed", type=str, default=None)
     p.add_argument("--local_rank", type=int, default=-1)
     return p.parse_args()
@@ -387,7 +394,7 @@ def main():
             ref_rejected_lps = cached["ref_rejected_logprobs"]
         else:
             ref_chosen_lps, ref_rejected_lps = precompute_ref_logprobs(
-                args.model_path, dtype, processor, ds["train"]
+                args.model_path, dtype, processor, ds["train"], max_length=args.max_length
             )
             torch.save({
                 "ref_chosen_logprobs": ref_chosen_lps,
@@ -444,7 +451,7 @@ def main():
         beta=args.beta, loss_type=args.loss_type,
         model=thinker, args=training_args,
         train_dataset=ds["train"], eval_dataset=ds.get("validation"),
-        data_collator=DataCollatorForDPO(processor=processor),
+        data_collator=DataCollatorForDPO(processor=processor, max_length=args.max_length),
         tokenizer=processor.tokenizer,
         callbacks=[SaveConfigCallback(args.model_path)],
     )
