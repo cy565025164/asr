@@ -382,7 +382,7 @@ def main():
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
-    # ---- 预计算 ref logprobs（仅 rank 0 计算，其余等待） ----
+    # ---- 预计算 ref logprobs（仅 rank 0 计算，其余等文件） ----
     cache_path = os.path.join(args.output_dir, "ref_logprobs.pt")
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -401,15 +401,18 @@ def main():
                 "ref_rejected_logprobs": ref_rejected_lps,
             }, cache_path)
             print(f"[INFO] Ref logprobs cached to {cache_path}")
-
-    # 同步：等 rank 0 算完
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-
-    if local_rank != 0:
+    else:
+        # 其他 rank 等待 rank 0 写完缓存文件
+        import time
+        print(f"[INFO] Rank {local_rank} waiting for ref logprobs cache...")
+        while not os.path.exists(cache_path):
+            time.sleep(5)
+        # 等文件写完（简单等一下确保不读到半截文件）
+        time.sleep(3)
         cached = torch.load(cache_path, weights_only=True)
         ref_chosen_lps = cached["ref_chosen_logprobs"]
         ref_rejected_lps = cached["ref_rejected_logprobs"]
+        print(f"[INFO] Rank {local_rank} loaded ref logprobs cache.")
 
     # 把 ref logprobs 加到 dataset
     ds["train"] = ds["train"].add_column("ref_chosen_logprobs", ref_chosen_lps)
