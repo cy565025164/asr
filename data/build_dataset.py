@@ -91,7 +91,7 @@ def load_annotations_from_dir(data_dir: str, task_filter: set = None) -> list:
                 base = {
                     "audio_path": str(audio_path),
                     "text": text,
-                    "sales_context": row.get("context", "").strip(),
+                    "sales_context": row.get("context", "").strip().replace("<unk>", ""),
                     "model_text": row.get("model_text", "").strip(),
                     "gender": gender,
                     "uncertain": row.get("文本拿不准", "").strip(),
