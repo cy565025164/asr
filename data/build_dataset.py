@@ -253,12 +253,21 @@ def build_dpo(annotations, tasks_config):
         if rejected.strip() == chosen.strip():
             continue
 
-        msgs = build_messages(task_id, task_cfg, ann)
+        # 构建系统提示词（含上下文）
+        system_text = task_cfg["system"]
+        if task_cfg.get("use_context", False):
+            sales_ctx = ann.get("sales_context", "")
+            if sales_ctx:
+                system_text += f"\n销售员上一句：{sales_ctx}"
+
         items.append({
-            "task": task_id,
-            "messages_prefix": msgs[:2],  # system + user
-            "chosen": chosen,
-            "rejected": rejected,
+            "conversations": [
+                {"from": "human", "value": task_cfg["user_prompt"]},
+            ],
+            "chosen": {"from": "gpt", "value": chosen},
+            "rejected": {"from": "gpt", "value": rejected},
+            "audios": [ann.get("audio_path", "")],
+            "system": system_text,
         })
 
     logger.info(f"DPO sources: {source_counts}")
@@ -301,11 +310,20 @@ def build_dpo_with_model(annotations, tasks_config, model_path):
 
         rejected = output if output.strip() != chosen.strip() else perturb_text(chosen)
         if rejected.strip() != chosen.strip():
+            system_text = task_cfg["system"]
+            if task_cfg.get("use_context", False):
+                sales_ctx = ann.get("sales_context", "")
+                if sales_ctx:
+                    system_text += f"\n销售员上一句：{sales_ctx}"
+
             items.append({
-                "task": task_id,
-                "messages_prefix": prefix_msgs,
-                "chosen": chosen,
-                "rejected": rejected,
+                "conversations": [
+                    {"from": "human", "value": task_cfg["user_prompt"]},
+                ],
+                "chosen": {"from": "gpt", "value": chosen},
+                "rejected": {"from": "gpt", "value": rejected},
+                "audios": [ann.get("audio_path", "")],
+                "system": system_text,
             })
 
         if (i + 1) % 10 == 0:
@@ -337,7 +355,7 @@ def main():
     dpo_p = sub.add_parser("dpo", help="构建 DPO 数据")
     add_data_args(dpo_p)
     dpo_p.add_argument("--task", nargs="+", help="指定任务类型，如 asr gender（默认全部）")
-    dpo_p.add_argument("--output", default="train_dpo.jsonl")
+    dpo_p.add_argument("--output", default="train_dpo.json")
     dpo_p.add_argument("--model_path", default=None)
     dpo_p.add_argument("--seed", type=int, default=42)
 
@@ -359,17 +377,17 @@ def main():
             items = build_dpo(annotations, tasks_config)
 
     random.shuffle(items)
-    with open(args.output, "w", encoding="utf-8") as f:
-        for item in items:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-    task_counts = {}
-    for item in items:
-        t = item["task"]
-        task_counts[t] = task_counts.get(t, 0) + 1
+    # DPO 输出 JSON 数组，SFT 保持 jsonl
+    if args.cmd == "dpo":
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    else:
+        with open(args.output, "w", encoding="utf-8") as f:
+            for item in items:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
     logger.info(f"Total: {len(items)} → {args.output}")
-    for t, c in sorted(task_counts.items()):
-        logger.info(f"  {t}: {c}")
 
 
 if __name__ == "__main__":

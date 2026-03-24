@@ -72,15 +72,29 @@ def copy_config_files(src, dst):
 # ============================================================
 
 def preprocess_dpo(ex, processor):
-    """预处理 DPO 数据"""
-    prefix_msgs = ex["messages_prefix"]
+    """预处理 DPO 数据（适配新 JSON 格式）"""
+    # 从新格式构建 messages_prefix
+    system_text = ex.get("system", "")
+    user_text = ex["conversations"][0]["value"]
+    audio_path = ex["audios"][0] if ex.get("audios") else ""
+
+    prefix_msgs = [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": [
+            {"type": "audio", "audio": audio_path},
+            {"type": "text", "text": user_text},
+        ]},
+    ]
+
     prefix_text = processor.apply_chat_template(
         [prefix_msgs], add_generation_prompt=True, tokenize=False
     )[0]
     return {
         "prefix_text": prefix_text,
-        "chosen": ex["chosen"],
-        "rejected": ex["rejected"],
+        "chosen": ex["chosen"]["value"],
+        "rejected": ex["rejected"]["value"],
+        "messages_prefix": prefix_msgs,
+    }
         "messages_prefix": prefix_msgs,
     }
 
@@ -376,11 +390,19 @@ def main():
 
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.model_path)
 
-    # ---- 数据加载 ----
-    raw_ds = load_dataset("json", data_files={
-        "train": args.train_file,
-        **({} if not args.eval_file else {"validation": args.eval_file}),
-    })
+    # ---- 数据加载（支持 json 数组和 jsonl）----
+    train_ext = os.path.splitext(args.train_file)[1].lower()
+    if train_ext == ".json":
+        raw_ds = load_dataset("json", data_files={"train": args.train_file}, field=None)
+    else:
+        raw_ds = load_dataset("json", data_files={"train": args.train_file})
+    if args.eval_file:
+        eval_ext = os.path.splitext(args.eval_file)[1].lower()
+        if eval_ext == ".json":
+            eval_ds = load_dataset("json", data_files={"validation": args.eval_file}, field=None)
+        else:
+            eval_ds = load_dataset("json", data_files={"validation": args.eval_file})
+        raw_ds["validation"] = eval_ds["validation"]
     ds = raw_ds.map(lambda ex: preprocess_dpo(ex, processor), num_proc=1)
     keep = {"prefix_text", "chosen", "rejected", "messages_prefix"}
     for split in ds.keys():
