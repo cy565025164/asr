@@ -16,6 +16,7 @@ import shutil
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import types
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
@@ -254,6 +255,13 @@ def main():
         args.model_path, dtype=dtype, device_map=None, attn_implementation="sdpa",
     )
     model.disable_talker()
+
+    # Qwen3OmniMoe 没有自己的 forward，需要补一个透传到 thinker 的 forward
+    # 这样 DeepSpeed 包装后 engine.forward → module.forward → thinker.forward 能正常工作
+    def _omni_forward(self, **kwargs):
+        return self.thinker(**kwargs)
+    model.forward = types.MethodType(_omni_forward, model)
+
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.model_path)
     model.gradient_checkpointing_enable()
 
@@ -263,6 +271,7 @@ def main():
         args.model_path, dtype=dtype, device_map=None, attn_implementation="sdpa",
     )
     ref_model.disable_talker()
+    ref_model.forward = types.MethodType(_omni_forward, ref_model)
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad = False
