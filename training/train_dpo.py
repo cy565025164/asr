@@ -16,7 +16,6 @@ import shutil
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-import types
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
@@ -255,25 +254,23 @@ def main():
         args.model_path, dtype=dtype, device_map=None, attn_implementation="sdpa",
     )
     model.disable_talker()
-
-    # Qwen3OmniMoe 没有自己的 forward，需要补一个透传到 thinker 的 forward
-    # 这样 DeepSpeed 包装后 engine.forward → module.forward → thinker.forward 能正常工作
-    def _omni_forward(self, **kwargs):
-        return self.thinker(**kwargs)
-    model.forward = types.MethodType(_omni_forward, model)
-
     processor = Qwen3OmniMoeProcessor.from_pretrained(args.model_path)
-    model.gradient_checkpointing_enable()
 
-    # Reference model
+    # 直接用 thinker 子模块：它有完整的 forward(input_ids, ...)
+    # 这样 DeepSpeed 能正确包装和管理参数
+    thinker = model.thinker
+    thinker.gradient_checkpointing_enable()
+    thinker.config = model.config  # Trainer 需要 config
+
+    # Reference model — 同样只取 thinker
     print(f"[INFO] Loading reference model")
-    ref_model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
+    ref_full = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
         args.model_path, dtype=dtype, device_map=None, attn_implementation="sdpa",
     )
-    ref_model.disable_talker()
-    ref_model.forward = types.MethodType(_omni_forward, ref_model)
-    ref_model.eval()
-    for p in ref_model.parameters():
+    ref_full.disable_talker()
+    ref_thinker = ref_full.thinker
+    ref_thinker.eval()
+    for p in ref_thinker.parameters():
         p.requires_grad = False
 
     # 数据
@@ -310,8 +307,8 @@ def main():
     )
 
     trainer = DPOTrainer(
-        ref_model=ref_model, beta=args.beta, loss_type=args.loss_type,
-        model=model, args=training_args,
+        ref_model=ref_thinker, beta=args.beta, loss_type=args.loss_type,
+        model=thinker, args=training_args,
         train_dataset=ds["train"], eval_dataset=ds.get("validation"),
         data_collator=DataCollatorForDPO(processor=processor),
         tokenizer=processor.tokenizer,
