@@ -162,7 +162,11 @@ def precompute_ref_logprobs(model_path, dtype, processor, dataset, max_length=20
             extra = {}
             for k, v in enc.items():
                 if k not in ("input_ids", "attention_mask", "labels"):
-                    extra[k] = v.to(device) if torch.is_tensor(v) else v
+                    if torch.is_tensor(v):
+                        v = v.to(device)
+                        if v.is_floating_point():
+                            v = v.to(dtype=dtype)
+                    extra[k] = v
 
             lp = _compute_logprobs_single(ref_thinker, input_ids, attention_mask, labels, extra)
             lp_list.append(lp)
