@@ -360,6 +360,7 @@ def parse_args():
     p.add_argument("--save_total_limit", type=int, default=3)
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
+    p.add_argument("--max_nums", type=int, default=0, help="最大训练样本数，0=全部（调试用）")
     p.add_argument("--max_length", type=int, default=2048, help="最大序列长度，超出截断（防 OOM）")
     p.add_argument("--deepspeed", type=str, default=None)
     p.add_argument("--local_rank", type=int, default=-1)
@@ -385,6 +386,11 @@ def main():
         drop = [c for c in ds[split].column_names if c not in keep]
         if drop:
             ds[split] = ds[split].remove_columns(drop)
+
+    # 限制训练样本数（调试用）
+    if args.max_nums > 0 and "train" in ds:
+        ds["train"] = ds["train"].select(range(min(args.max_nums, len(ds["train"]))))
+        print(f"[INFO] Limiting training data to {len(ds['train'])} samples")
 
     # ---- 预计算 ref logprobs（仅 rank 0 计算，其余等文件） ----
     cache_path = os.path.join(args.output_dir, "ref_logprobs.pt")
